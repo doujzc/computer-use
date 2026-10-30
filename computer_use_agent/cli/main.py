@@ -40,6 +40,13 @@ async def turn(agent, message, conversation_id, terminal, journal):
     streamed = False
     async for chunk in agent.stream({"query": message, "conversation_id": conversation_id}):
         journal.record("agent", chunk.model_dump(mode="json") if hasattr(chunk, "model_dump") else str(chunk))
+        payload = getattr(chunk, "payload", None)
+        if (
+            getattr(chunk, "type", "") == "answer"
+            and isinstance(payload, dict)
+            and payload.get("result_type") == "error"
+        ):
+            raise RuntimeError(payload.get("output") or payload.get("content") or "Agent task failed.")
         visible = terminal.chunk(chunk, already_streamed=streamed)
         if getattr(chunk, "type", "") == "llm_output":
             streamed |= visible
