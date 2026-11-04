@@ -340,7 +340,7 @@ class Runtime:
         for computer in self.computers:
             # pylint: disable-next=protected-access
             transport = computer._controller.transport
-            if hasattr(transport, "waitClosed"):
+            if hasattr(transport, "wait_closed"):
                 await transport.wait_closed()
 
 

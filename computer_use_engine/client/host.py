@@ -38,7 +38,7 @@ def computer_host(factory=None):
         transport = computer._controller.transport
         if hasattr(transport, "close"):
             transport.close()
-        if hasattr(transport, "waitClosed"):
+        if hasattr(transport, "wait_closed"):
             await transport.wait_closed()
 
     return Record(computer=computer, close=close)

@@ -48,8 +48,12 @@ def now():
 
 
 class Journal:
-    def __init__(self):
-        directory = Path(os.environ.get("COMPUTER_USE_LOG_DIR", str(Path.home() / ".computer-use/logs")))
+    def __init__(self, directory=None):
+        directory = Path(
+            directory
+            if directory is not None
+            else os.environ.get("COMPUTER_USE_LOG_DIR", str(Path.home() / ".computer-use/logs"))
+        )
         self.path = directory / (now().replace(":", "-").replace(".", "-") + "-" + str(uuid.uuid4()) + ".jsonl")
         self._error = None
         try:
