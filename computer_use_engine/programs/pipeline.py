@@ -45,6 +45,11 @@ class ProgramContext:
         self.current, self.write_started = None, False
         self._failure, self._owner = None, asyncio.current_task()
 
+    @property
+    def first_failure(self) -> BaseException | None:
+        """Expose the latched cause without transferring failure-state ownership."""
+        return self._failure
+
     def _remember(self, error):
         if self._failure is None:
             self._failure = error
@@ -154,7 +159,7 @@ async def execute(
             run.ensure_active()
     except BaseException as error:
         termination = error
-        error = run._failure or error
+        error = run.first_failure or error
         status = (
             "cancelled"
             if isinstance(termination, asyncio.CancelledError)

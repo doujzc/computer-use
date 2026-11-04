@@ -143,6 +143,15 @@ def test_incomplete_or_unknown_positive_cannot_admit(registry, changes, message)
         registry.admit("example.flow", "1", review(registry))
 
 
+@pytest.mark.parametrize("recording_complete", [0, 1, "true", None])
+def test_recording_completeness_requires_boolean_evidence(registry, recording_complete):
+    planned = attempt(registry, "positive")
+    with pytest.raises(ValueError, match="Invalid episode evidence"):
+        evidence(registry, planned, recording_complete=recording_complete)
+    packet = registry.review_packet("example.flow", "1")
+    assert packet["evidence"][0]["result"] is None
+
+
 def test_missing_negative_or_false_accept_blocks_admission(registry):
     evidence(registry, attempt(registry, "positive"))
     with pytest.raises(ValueError, match="negative"):

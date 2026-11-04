@@ -86,12 +86,14 @@ class Evidence:
         for key, value in asdict(self).items():
             if key.endswith("sha256"):
                 _sha(value)
+        if not all(
+            (self.episode_id, self.program_id, self.program_version, self.task, self.outcome)
+        ) or self.split not in ("development", "admission", "final"):
+            raise ValueError("Invalid episode evidence")
         if (
-            not all((self.episode_id, self.program_id, self.program_version, self.task, self.outcome))
-            or self.split not in ("development", "admission", "final")
-            or self.acceptance not in ("TRUE", "FALSE", "UNKNOWN")
+            self.acceptance not in ("TRUE", "FALSE", "UNKNOWN")
             or self.expected_acceptance not in ("TRUE", "FALSE")
-            or type(self.recording_complete) is not bool
+            or not isinstance(self.recording_complete, bool)
         ):
             raise ValueError("Invalid episode evidence")
 
@@ -271,11 +273,9 @@ class Registry:
         key = (program_id, version)
         with self._transaction() as db:
             current = db.execute("SELECT state FROM versions WHERE id=? AND version=?", key).fetchone()
-            if (
-                not current
-                or current["state"] == "retired"
-                or (current["state"] == "invalidated" and state != "retired")
-            ):
+            if not current or current["state"] == "retired":
+                raise ValueError("Invalid lifecycle transition")
+            if current["state"] == "invalidated" and state != "retired":
                 raise ValueError("Invalid lifecycle transition")
             db.execute("UPDATE versions SET state=? WHERE id=? AND version=?", (state, *key))
             self._history(db, key, state, reason, "host")

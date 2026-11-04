@@ -83,12 +83,12 @@ class Artifact:
             "expected_parameters",
         }:
             raise ValueError("Acceptance must declare condition, scope and expected parameters")
+        if not isinstance(acceptance["condition"], str) or not acceptance["condition"]:
+            raise ValueError("Acceptance must cover declared parameters and a string scope")
+        if acceptance["scope_parameter"] not in schema or schema[acceptance["scope_parameter"]].get("type") != "string":
+            raise ValueError("Acceptance must cover declared parameters and a string scope")
         if (
-            not isinstance(acceptance["condition"], str)
-            or not acceptance["condition"]
-            or acceptance["scope_parameter"] not in schema
-            or schema[acceptance["scope_parameter"]].get("type") != "string"
-            or not isinstance(acceptance["expected_parameters"], list)
+            not isinstance(acceptance["expected_parameters"], list)
             or not acceptance["expected_parameters"]
             or any(key not in schema for key in acceptance["expected_parameters"])
         ):

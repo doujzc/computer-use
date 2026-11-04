@@ -4,12 +4,14 @@
 """Generic episode/admission bridge; no task-specific harness or desktop."""
 
 import json
+import sys
 
 import pytest
 
 from computer_use.programs.admission import Registry
 from computer_use_native_tools.evaluation.admission import (
     instance_fingerprint,
+    main,
     prepare_episode,
     record_summary,
     seed_development,
@@ -101,3 +103,39 @@ def test_final_results_cannot_enter_review_packet(tmp_path):
     path.write_text(json.dumps({"metadata": {"split": "final", "arm": "program"}}))
     with pytest.raises(ValueError, match="Only program admission"):
         record_summary(Registry(tmp_path / "registry.sqlite"), path)
+
+
+def test_admission_cli_emits_one_unprefixed_json_packet_per_call(tmp_path, monkeypatch, capsys):
+    artifact = artifact_at(tmp_path / "artifact", program_id="workspace.审查")
+    registry_path = tmp_path / "registry.sqlite"
+    base_args = ["admission", "--registry", str(registry_path), "--artifact", str(artifact.path)]
+    for command in (["register", "--development-runs", str(tmp_path / "runs")], ["packet"]):
+        monkeypatch.setattr(sys, "argv", base_args + command)
+        main()
+        output = capsys.readouterr()
+        packet = Registry(registry_path).review_packet(artifact.definition["id"], "1")
+        assert json.loads(output.out) == packet
+        assert output.out == json.dumps(packet, ensure_ascii=False, indent=2) + "\n"
+        assert output.err == ""
+
+
+@pytest.mark.parametrize("failed_operation", ["write", "flush"])
+def test_admission_cli_does_not_hide_packet_delivery_failure(tmp_path, monkeypatch, failed_operation):
+    import io
+
+    artifact = artifact_at(tmp_path / "artifact")
+    registry = Registry(tmp_path / "registry.sqlite")
+    registry.register(artifact.definition)
+    monkeypatch.setattr(
+        sys, "argv", ["admission", "--registry", str(registry.path), "--artifact", str(artifact.path), "packet"]
+    )
+    output = io.StringIO()
+
+    def fail(*args):
+        raise OSError("packet delivery failed")
+
+    monkeypatch.setattr(output, failed_operation, fail)
+    with monkeypatch.context() as streams:
+        streams.setattr(sys, "stdout", output)
+        with pytest.raises(OSError, match="packet delivery failed"):
+            main()

@@ -10,12 +10,12 @@ reset, including attempts that later fail or never deliver a summary.
 
 import argparse
 import json
-import sys
 from pathlib import Path
 
 from computer_use.programs.admission import Attempt, Evidence, HumanReview, Registry, fingerprint
 from computer_use.programs.artifact import Artifact
 
+from ..console import report
 from .ledger import EnvironmentBlocked, enumerate_episodes
 from .provenance import digest
 
@@ -127,7 +127,7 @@ def main():
     elif args.command == "withdraw":
         registry.withdraw(program["id"], program["version"], state=args.state, reason=args.reason)
     packet = registry.review_packet(program["id"], program["version"])
-    sys.stdout.write(json.dumps(packet, ensure_ascii=False, indent=2) + "\n")
+    report(json.dumps(packet, ensure_ascii=False, indent=2), raise_errors=True)
 
 
 if __name__ == "__main__":

@@ -57,7 +57,10 @@ def conclude(result: ProgramResult, acceptance: Check) -> ProgramResult:
         acceptance.condition != result.acceptance_condition
         or acceptance.scope != result.scope
         or acceptance.evidence.get("expected_sha256") != result.expected_sha256
-        or acceptance.evidence.get("execution_id") != result.execution_id
+    ):
+        raise ValueError("Acceptance does not cover the requested program outcome")
+    if (
+        acceptance.evidence.get("execution_id") != result.execution_id
         or not result.returned_at_s <= acceptance.observed_at_s <= monotonic()
     ):
         raise ValueError("Acceptance does not cover the requested program outcome")
