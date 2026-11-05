@@ -199,7 +199,7 @@ async def main(argv=None):
         logger.exception("Computer Use CLI failed")
         message = journal.redact(str(error)) if journal else str(error)
         if isinstance(error, ModuleNotFoundError):
-            message += "\n安装 Agent 依赖：uv sync --extra agent（Python 3.12 或 3.13）。"
+            message += "\n安装 Agent 依赖：uv sync --extra agent（Python 3.11～3.13）。"
         if terminal is not None:
             terminal.line(message, style="red")
         else:

@@ -1,9 +1,7 @@
 # coding: utf-8
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 
-import asyncio
 from contextvars import ContextVar
-from functools import wraps
 
 # Private variables hold mutable session state.
 # pylint: disable-next=invalid-name
@@ -13,21 +11,6 @@ _nested = ContextVar("computer_use_nested", default=False)
 _revision = 0
 # pylint: disable-next=invalid-name
 _active = 0
-
-
-def eager(function):
-    """Match Promise calls: start immediately, including when await is omitted."""
-
-    @wraps(function)
-    def start(*args, **kwargs):
-        coroutine = function(*args, **kwargs)
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return coroutine
-        return asyncio.Task(coroutine, loop=loop, eager_start=True)
-
-    return start
 
 
 def operation_checkpoint():
