@@ -5,6 +5,7 @@
 
 import hashlib
 import json
+import os
 import shutil
 from collections.abc import Iterator
 from pathlib import Path
@@ -83,6 +84,10 @@ class BuildWithResources(build_py):
         super().run()
         output = Path(self.build_lib) / "computer_use" / "_resources"
         output.mkdir(parents=True, exist_ok=True)
+        backend = os.environ.get("COMPUTER_USE_BACKEND_DIR")
+        if backend:
+            shutil.copytree(backend, output, dirs_exist_ok=True)
+            return
         resources = [ROOT / name for name in FILES]
         for directory in DIRECTORIES:
             base = ROOT / directory
