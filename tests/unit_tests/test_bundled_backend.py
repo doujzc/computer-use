@@ -1,6 +1,7 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 
 import json
+import subprocess
 import sys
 from importlib import import_module
 from pathlib import Path
@@ -82,6 +83,57 @@ def test_linux_platform_wheel_reports_missing_backend(installed, monkeypatch):
 
     with pytest.raises(RuntimeError, match="Bundled Linux backend wheel is missing"):
         native.build_native()
+
+
+def test_linux_source_build_wheel_launches_installed_driver(installed, monkeypatch, tmp_path):
+    resources, home = installed
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("COMPUTER_USE_PYTHON", sys.executable)
+    runtime = resources / paths.LINUX_RUNTIME
+    driver_package = tmp_path / "os_adapter/linux/src/computer_use_linux"
+    driver_package.mkdir(parents=True)
+    (driver_package / "__init__.py").touch()
+    (driver_package / "__main__.py").write_text("def main():\n    return 7\n", encoding="utf-8")
+
+    run = native.run
+
+    def run_during_packaging(command, args, cwd, capture=False):
+        if capture:
+            return run(command, args, cwd, capture=True)
+        assert args[:3] == ["-m", "pip", "install"]
+        runtime.mkdir(parents=True)
+
+    monkeypatch.setattr(native, "run", run_during_packaging)
+    native.stage_linux_runtime(tmp_path, runtime)
+
+    def unexpected_setup(*args, **kwargs):
+        pytest.fail("The installed driver attempted runtime setup.")
+
+    monkeypatch.setattr(native, "run", unexpected_setup)
+    driver = paths.native_driver()
+    assert Path(driver["args"][-1]).is_relative_to(home)
+    assert native.build_native() == Path(driver["command"])
+    assert subprocess.run([driver["command"], *driver["args"]], check=False).returncode == 7
+
+
+@pytest.mark.parametrize("returncode", [0, 1])
+def test_linux_python_prefers_a_supported_system_interpreter(monkeypatch, returncode):
+    monkeypatch.delenv("COMPUTER_USE_PYTHON", raising=False)
+    system_python = "/usr/bin/python3"
+    monkeypatch.setattr(paths.shutil, "which", lambda command: system_python)
+
+    def run(args, *, stdout, stderr, check):
+        assert args[:4] == [system_python, "-I", "-S", "-c"]
+        return subprocess.CompletedProcess(args, returncode)
+
+    monkeypatch.setattr(paths.subprocess, "run", run)
+    assert paths.linux_python() == (system_python if returncode == 0 else sys.executable)
+
+
+def test_linux_wheel_reports_invalid_python_probe(monkeypatch, tmp_path):
+    monkeypatch.setattr(native, "run", lambda *args: "unexpected interpreter output")
+    with pytest.raises(RuntimeError, match="Could not read the Linux desktop Python version and ABI"):
+        native.stage_linux_runtime(tmp_path, tmp_path / "runtime")
 
 
 def test_source_wheel_keeps_a_writable_build_tree(installed):

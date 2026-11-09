@@ -6,13 +6,21 @@
 import hashlib
 import json
 import os
+import platform
 import shutil
+import subprocess
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 from setuptools import find_packages, setup
 from setuptools.command.build_py import build_py
+
+try:
+    from setuptools.command.bdist_wheel import bdist_wheel
+except ModuleNotFoundError:
+    from wheel.bdist_wheel import bdist_wheel
 
 ROOT = Path(__file__).resolve().parent
 
@@ -67,7 +75,33 @@ FILES = (
 RESOURCE_SUFFIXES = {".swift", ".cs", ".py", ".svg", ".json", ".md", ".html", ".css", ".js", ".mjs"}
 
 
+def native_platform():
+    machine = platform.machine().lower()
+    if sys.platform == "darwin" and machine in {"arm64", "x86_64"}:
+        if tuple(map(int, platform.mac_ver()[0].split(".")[:2])) >= (14, 0):
+            return f"macosx_14_0_{machine}"
+    if sys.platform == "win32" and machine in {"amd64", "x86_64"}:
+        return "win_amd64"
+    if sys.platform == "linux" and machine in {"x86_64", "aarch64"}:
+        return f"linux_{machine}"
+    return None
+
+
+class NativeWheel(bdist_wheel):
+    def finalize_options(self):
+        self.native_platform = None if os.environ.get("COMPUTER_USE_BACKEND_DIR") else native_platform()
+        if self.native_platform is not None:
+            self.plat_name = self.native_platform
+        super().finalize_options()
+
+    def run(self):
+        self.distribution.get_command_obj("build_py").native_platform = self.native_platform
+        super().run()
+
+
 class BuildWithResources(build_py):
+    native_platform = None
+
     def run(self):
         # The build tree belongs to this distribution. Clear it as a whole so
         # retired top-level hosts cannot leak into a wheel after a relocation.
@@ -82,7 +116,7 @@ class BuildWithResources(build_py):
         if output_root.exists():
             shutil.rmtree(output_root)
         super().run()
-        output = Path(self.build_lib) / "computer_use" / "_resources"
+        output = resolved / "computer_use" / "_resources"
         output.mkdir(parents=True, exist_ok=True)
         backend = os.environ.get("COMPUTER_USE_BACKEND_DIR")
         if backend:
@@ -105,16 +139,31 @@ class BuildWithResources(build_py):
                         yield path
 
             resources.extend(_iter_path(iter(base.rglob("*")), base))
-        manifest = {}
         for source in sorted(set(resources)):
             relative = source.relative_to(ROOT)
             target = output / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
-            manifest[relative.as_posix()] = hashlib.sha256(source.read_bytes()).hexdigest()
+        if self.native_platform:
+            subprocess.run(
+                [
+                    sys.executable, "-m", "computer_use_native_tools.native",
+                    str(ROOT), str(output), self.native_platform,
+                ],
+                cwd=resolved,
+                check=True,
+            )
+        manifest = {
+            path.relative_to(output).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in sorted(output.rglob("*")) if path.is_file()
+        }
         (output / "manifest.json").write_text(
             json.dumps(manifest, sort_keys=True, separators=(",", ":")), encoding="utf-8"
         )
 
 
-setup(packages=discover_packages(), package_dir=PACKAGE_ROOTS, cmdclass={"build_py": BuildWithResources})
+setup(
+    packages=discover_packages(),
+    package_dir=PACKAGE_ROOTS,
+    cmdclass={"build_py": BuildWithResources, "bdist_wheel": NativeWheel},
+)
