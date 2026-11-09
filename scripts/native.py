@@ -31,7 +31,7 @@ def run(command, args, cwd=None, capture=False):
     return result.stdout.strip() if capture else result
 
 
-def build_mac_os(root=None):
+def build_mac_os(root=None, *, configuration="debug"):
     if sys.platform != "darwin":
         raise RuntimeError("Only the macOS backend is implemented.")
     from .pointer import generate_pointer_assets
@@ -39,8 +39,8 @@ def build_mac_os(root=None):
     root = Path(root) if root else repository_root()
     generate_pointer_assets(root=root)
     native = root / "os_adapter/macos"
-    run("swift", ["build", "-c", "debug"], native)
-    binary = Path(run("swift", ["build", "-c", "debug", "--show-bin-path"], native, True))
+    run("swift", ["build", "-c", configuration], native)
+    binary = Path(run("swift", ["build", "-c", configuration, "--show-bin-path"], native, True))
     bundle = native / ".build/ComputerUseDriver.app"
     executable = bundle / "Contents/MacOS/computer-use-driver"
     executable.parent.mkdir(parents=True, exist_ok=True)
@@ -78,7 +78,13 @@ def build_linux(root=None, *, protocol_version=NATIVE_PROTOCOL_VERSION):
     _protocol_version(protocol_version)
     if sys.platform != "linux":
         raise RuntimeError("Build the Linux backend on Linux (PyGObject is a system dependency).")
-    native = (Path(root) if root else repository_root()) / "os_adapter/linux"
+    root = Path(root) if root else repository_root()
+    native = root / "os_adapter/linux"
+    bundled = (root / "backend.json").is_file()
+    wheel = next((native / ".build").glob("*.whl"), None) if bundled else None
+    if bundled and wheel is None:
+        raise RuntimeError("Bundled Linux backend wheel is missing. Reinstall openjiuwen-computeruse.")
+    import_path = str(wheel) if bundled else "src"
     python = os.environ.get("COMPUTER_USE_PYTHON") or "/usr/bin/python3"
     check = (
         f"from computer_use_linux.runtime.resources import check_installation; check_installation({protocol_version}"
@@ -89,9 +95,9 @@ def build_linux(root=None, *, protocol_version=NATIVE_PROTOCOL_VERSION):
             [
                 "-c",
                 (
-                    "import sys; assert sys.version_info >= (3,10), 'Python >= 3.10 "
+                    "import sys; assert sys.version_info >= (3,11), 'Python >= 3.11 "
                     "required'; "
-                    "sys.path.insert(0, 'src'); "
+                    f"sys.path.insert(0, {import_path!r}); "
                 )
                 + check
                 + ")",
@@ -114,9 +120,11 @@ def build_linux(root=None, *, protocol_version=NATIVE_PROTOCOL_VERSION):
     requirements = (native / "requirements.lock").read_text(encoding="utf-8")
     stamp = venv / "computer-use-requirements.txt"
     if not stamp.exists() or stamp.read_text(encoding="utf-8") != requirements:
-        run(executable, ["-m", "pip", "install", "-r", "requirements.lock"], native)
+        binary = ["--only-binary=:all:"] if bundled else []
+        run(executable, ["-m", "pip", "install", *binary, "-r", "requirements.lock"], native)
         stamp.write_text(requirements, encoding="utf-8")
-    run(executable, ["-m", "pip", "install", "--no-deps", "--editable", "."], native)
+    package = [str(wheel)] if bundled else ["--editable", "."]
+    run(executable, ["-m", "pip", "install", "--no-deps", *package], native)
     run(
         executable,
         [
@@ -138,6 +146,9 @@ def build_linux(root=None, *, protocol_version=NATIVE_PROTOCOL_VERSION):
 
 def build_native(root=None, *, protocol_version=NATIVE_PROTOCOL_VERSION):
     _protocol_version(protocol_version)
+    root = Path(root) if root else repository_root()
+    if sys.platform in ("darwin", "win32") and (root / "backend.json").is_file():
+        return Path(native_driver(root=root)["command"])
     if sys.platform == "darwin":
         return build_mac_os(root)
     if sys.platform == "linux":
