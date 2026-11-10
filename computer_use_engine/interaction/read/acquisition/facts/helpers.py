@@ -15,6 +15,7 @@ from computer_use.native.semantics import (
     RAW_NODE_METADATA_FIELDS,
     TABLE_FIELDS,
     WINDOWS_ON_DEMAND_FIELDS,
+    WINDOWS_OBSERVATION_SCOPE_FIELDS,
     WINDOWS_READ_V2_FIELDS,
     WINDOWS_TEXT_CONTEXT_FIELDS,
     WINDOWS_TEXT_LINE_FIELDS,
@@ -43,10 +44,7 @@ def validate_fact_scope(target: Binding, max_nodes: int, max_depth: int | None) 
                 code="observation_incomplete",
                 effect="none",
                 target="native observation",
-                detail=(
-                    "This surface has no accessible root; its window identity remains available for visual observation."
-                ),
-                next="use a supported window capture route; do not infer that the window has no content",
+                detail="AX root unavailable in this observation.",
             )
         )
     invalid_max_nodes = (
@@ -103,22 +101,30 @@ def plan_fact_profile(scope: FactScope, capabilities: NativeReadCapabilities) ->
     elif max_depth > 40 and "nativeNodeDepthBudget" not in features:
         raise ValueError("This driver supports an explicit depth of at most 40")
     options: Record = {} if children_page is None else dict(children_page=children_page)
+    if request.strict_window:
+        options["strict_window"] = True
     if relation_page is not None:
         options["relation_page"] = relation_page
     # A root's children page and its independent content relationships
     # are separate read dimensions. Keep the same bounded content profile
     # for App.read and Element.read, including continued children pages.
     if fields is None:
-        relations = followed_relations(platform, features)
+        relations = () if request.scope_kind == "applicationContent" else followed_relations(platform, features)
         if relations:
             options["follow_relations"] = list(relations)
-        # Popup ownership is operation-specific receiver evidence. Query
-        # it for a selected editor, not every node of a display read (or
-        # older drivers which do not implement nativeVirtualFocus).
+        supports_focused_read = (
+            platform == "macos" and request.scope_kind == "window" and "nativeFocusedReadV1" in features
+        )
+        if supports_focused_read and children_page is None and relation_page is None:
+            options["focused_element"] = True
+        # Query popup state only where the provider declares it. It is an
+        # observation fact; resolving the actual popup receiver is separate.
         fields = [key for key, semantic in FIELDS[platform].items() if semantic != "hasPopup"]
         if platform == "windows" and "nativeUiaReadV2" not in features:
             fields = [key for key in fields if key not in WINDOWS_READ_V2_FIELDS]
         if platform == "windows":
+            if "nativeObservationScopes" not in features:
+                fields = [key for key in fields if key not in WINDOWS_OBSERVATION_SCOPE_FIELDS]
             fields = [key for key in fields if key not in WINDOWS_ON_DEMAND_FIELDS]
             if "nativeUiaTextLines" not in features:
                 fields = [key for key in fields if key not in WINDOWS_TEXT_LINE_FIELDS]
@@ -169,6 +175,11 @@ def plan_fact_profile(scope: FactScope, capabilities: NativeReadCapabilities) ->
             # Reuse the provider's declared attributes, avoiding getters
             # for menu-only properties on unrelated document controls.
             options.setdefault("advertised_fields", []).extend(MACOS_MENU_SHORTCUT_FIELDS)
+        if platform == "macos" and "nativeAdvertisedFields" in features:
+            fields.append("AXHasPopup")
+            options.setdefault("advertised_fields", []).append("AXHasPopup")
+        if platform == "macos" and "nativeParameterizedText" in features:
+            options["text_content"] = True
         if "nativeRawNodeMetadata" in features:
             fields.extend(RAW_NODE_METADATA_FIELDS[platform])
     return FactProfile(scope, fields, max_depth, options)

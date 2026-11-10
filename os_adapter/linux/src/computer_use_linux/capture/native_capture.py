@@ -61,7 +61,7 @@ class NativeCapture:
         require(
             getattr(self.b.desktop, "can_capture", False),
             "This desktop has no native pixel capture route.",
-            "mode_unsupported",
+            "unsupported_operation",
         )
         ctx.check()
         self.b.ensure_unlocked()
@@ -149,7 +149,6 @@ class NativeCapture:
         ctx.check()
         # One X screen is a unified canvas, not a claimed physical monitor.
         observation = dict(
-            mode=self.b.mode,
             canvas=dict(width=width, height=height),
             frontmost=frontmost,
             displays=[dict(name="X11 screen", rect=dict(x=0, y=0, width=width, height=height), captured=True)],
@@ -210,12 +209,12 @@ class NativeCapture:
         expected = image.keyboard
         require(
             expected is not None and expected.instance.alive,
-            "The observed desktop keyboard window is unknown or expired; read the desktop before keys.",
+            "The observed desktop keyboard window is unknown or expired.",
             "stale_target",
         )
         current = self.keyboard_snapshot(ctx)
         require(
-            current == expected, "The desktop keyboard window changed; read the desktop before keys.", "stale_target"
+            current == expected, "The desktop keyboard window changed.", "stale_target"
         )
         return expected
 
@@ -267,7 +266,7 @@ class NativeCapture:
         retained = self.entries.get(target["capture"])
         require(
             retained is not None and retained.target == target,
-            "The original image binding expired or changed scope; read before using coordinates.",
+            "The original image binding expired or changed scope.",
             "stale_target",
         )
         return retained

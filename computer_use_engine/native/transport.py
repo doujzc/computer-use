@@ -29,10 +29,14 @@ from computer_use.native.contracts import (
     CurrentReceiverEvidence,
     Dispatch,
     Facts,
+    GlobalTarget,
     HostPolicy,
+    InputEffect,
     InputContext,
     Knowledge,
     OpenedOperation,
+    NativeImpact,
+    PreparationImpact,
     Primitive,
     StepResult,
 )
@@ -41,9 +45,11 @@ from computer_use.native.queries import NativeNodeQuery
 from computer_use.native.semantics import control_capabilities, input_container
 from computer_use.protocol.captures import capture_metadata
 from computer_use.protocol.primitives import utf16_length
+from computer_use.protocol.records import relation_end, relation_slots
 
 if TYPE_CHECKING:
     from computer_use.protocol.records import Record
+
 
 _BINDING = dict(
     session="session", instance="instance", root_window="rootWindow", surface="surface", node="node", capture="capture"
@@ -75,12 +81,16 @@ def encode_fields(value, mapping):
 
 
 def decode_binding(value):
+    if value.get("global") is True:
+        return GlobalTarget(value["session"])
     if "application" in value:
         return ApplicationBinding(value["session"], value["application"])
     return Binding(**{name: value[wire] for name, wire in _BINDING.items()})
 
 
 def encode_target(target):
+    if isinstance(target, GlobalTarget):
+        return {"session": target.session, "global": True}
     return (
         dict(session=target.session, application=target.application)
         if isinstance(target, ApplicationBinding)
@@ -148,6 +158,29 @@ def decode_click_receipt(value):
     )
 
 
+def decode_native_impact(value):
+    if value is None:
+        return None
+    return NativeImpact(
+        value["coverage"],
+        tuple(InputEffect(**item) for item in value["effects"]),
+        Knowledge(value["foregroundChanged"]),
+        value["clipboardRestoration"],
+        value.get("omittedEffects", 0),
+        value.get("foregroundRestoration", "unavailable"),
+    )
+
+
+def decode_step_result(value):
+    return StepResult(
+        decode_binding(value["target"]), Dispatch(value["dispatch"]), value["detail"],
+        tuple(value["preparation"]), Confirmation(value["confirmation"]), Cleanup(value["cleanup"]),
+        value["errorCode"], value["retryReason"], value["context"], value.get("application"),
+        decode_click_receipt(value.get("click")), decode_native_impact(value.get("impact")),
+        value.get("appChangeInputBaseline"),
+    )
+
+
 class ConnectionPort:
     def __init__(self, connection, policy: HostPolicy):
         if connection.protocol_version != 6:
@@ -155,6 +188,7 @@ class ConnectionPort:
         self.connection, self.policy = connection, policy
         self._operations = {}
         self._continuations = {}
+        self.capture_references: frozenset[str] = frozenset()
         self.calls = CallLifecycle(self)
 
     @staticmethod
@@ -177,11 +211,24 @@ class ConnectionPort:
 
     async def connect(self, timeout_ms):
         hello = await self.connection.connect(timeout_ms)
-        if "nativeDirectory" not in hello["capabilities"]:
-            raise RuntimeError("This driver does not provide the native discovery contract")
         return Binding(hello["session"], None, None, None)
 
     async def directory(self, operation, target, query, timeout_ms):
+        if "nativeDirectory" not in self.capabilities:
+            raise RuntimeError("This driver does not provide the native discovery contract")
+        if "windowTitle" in query and (
+            self.platform != "windows"
+            or not {"nativeWindowTitleSelection", "nativeStrictWindowRead"} <= set(self.capabilities)
+        ):
+            raise local_failure(
+                "exact window title selection requires a supporting Windows driver", "unsupported_operation"
+            )
+        if "rootWindow" in query and (
+            self.platform != "windows" or "nativeStrictWindowRead" not in self.capabilities
+        ):
+            raise local_failure(
+                "strict window collection requires a supporting Windows driver", "unsupported_operation"
+            )
         self._check(operation)
         result = await self.connection.request(
             "inspect",
@@ -193,20 +240,36 @@ class ConnectionPort:
             if (
                 result["kind"] != query["kind"]
                 or result["session"] != target.session
+                or query["kind"] == "windowCatalogue" and result["appName"] != query["appName"]
                 or query["kind"] in ("surfaces", "roots")
                 and result["application"] != query["application"]
                 or result["platform"] != self.platform
+                or query["kind"] == "applications" and (
+                    any(result.get(key) != query.get(key) for key in ("path", "installation"))
+                    or ("endedApplications" in result) != (query.get("includeEnded") is True)
+                )
             )
             else False
         )
         if invalid_result:
             raise ValueError("Native discovery changed the requested session or application")
+        if "windowTitle" in query and result.get("windowTitle", {}).get("title") != query["windowTitle"]:
+            raise ValueError("Native discovery changed the requested window caption")
+        if (
+            query["kind"] == "surfaceBatch"
+            and [entry["application"] for entry in result["entries"]] != query["applications"]
+        ):
+            raise ValueError("Native discovery changed the requested application order or coverage")
         return result
 
     async def begin(self, intent, target, timeout_ms):
-        return await self._begin(
-            dict(kind=intent.kind, parameters=dict(intent.parameters)), "write", target, timeout_ms
-        )
+        return await self._begin(self._intent_payload(intent, target), "write", target, timeout_ms)
+
+    def _intent_payload(self, intent, target=None):
+        value = dict(kind=intent.kind, parameters=dict(intent.parameters))
+        if self.platform == "macos" or (self.platform == "windows" and isinstance(target, GlobalTarget)):
+            value["globalInput"] = intent.global_input
+        return value
 
     async def begin_read(self, target, timeout_ms):
         return await self._begin(dict(kind="read", parameters={}), "read", target, timeout_ms)
@@ -215,7 +278,7 @@ class ConnectionPort:
         self.calls.check_begin(intent["kind"], mode, target)
         original = intent_key(intent)
         version = None
-        if mode == "write" and intent["kind"] == "click":
+        if mode == "write" and intent["kind"] == "click" and not isinstance(target, GlobalTarget):
             version = next(
                 (
                     v
@@ -234,7 +297,40 @@ class ConnectionPort:
         self._operations[value["operation"]] = (self.connection.session_identity, original, version)
         while len(self._operations) > 8:
             self._operations.pop(next(iter(self._operations)))
-        return OpenedOperation(value["operation"], decode_binding(value["target"]), version)
+        return OpenedOperation(
+            value["operation"], decode_binding(value["target"]), version, value.get("appChangeBaseline")
+        )
+
+    async def locate_point(self, target, point, timeout_ms):
+        value = await self.connection.request(
+            "locatePoint",
+            {
+                "target": encode_fields(target, _BINDING),
+                "point": None if point is None else {"x": point[0], "y": point[1]},
+            },
+            {"timeoutMs": timeout_ms},
+        )
+        return value["point"]["x"], value["point"]["y"]
+
+    async def execute_global(self, operation, target, intent, timeout_ms):
+        if self._check(operation) != intent_key(self._intent_payload(intent, target)):
+            raise local_failure("The global input intent is already bound", "invalid_request", "execute")
+        value = await self.connection.request(
+            "execute",
+            {
+                "operation": operation,
+                "step": 1,
+                "command": {
+                    "kind": "global_input", "primitiveId": "global",
+                    "target": encode_target(target), "foreground": False,
+                },
+            },
+            {"timeoutMs": timeout_ms},
+        )
+        if decode_binding(value["target"]) != target or "click" in value:
+            self.calls.retired = True
+            raise ValueError("Native global input changed its session or added an object click contract")
+        return decode_step_result(value)
 
     async def inspect(
         self,
@@ -275,8 +371,7 @@ class ConnectionPort:
             if "nativeCurrentReceiver" not in self.capabilities:
                 raise local_failure(
                     "backend does not provide nativeCurrentReceiver",
-                    "update the driver before querying current receiver evidence",
-                    "mode_unsupported",
+                    "unsupported_operation",
                     "inspect",
                 )
             query["currentReceiver"] = True
@@ -295,16 +390,14 @@ class ConnectionPort:
             if actuator.relation == "controlPart" and "nativeControlParts" not in self.capabilities:
                 raise local_failure(
                     "backend does not provide nativeControlParts",
-                    "update the driver before selecting a pointer control member",
-                    "mode_unsupported",
+                    "unsupported_operation",
                     "inspect",
                 )
             if actuator.relation == "scrollPointer":
                 if "nativeElementScroll" not in self.capabilities:
                     raise local_failure(
                         "backend does not provide nativeElementScroll",
-                        "update the driver before selecting an element wheel route",
-                        "mode_unsupported",
+                        "unsupported_operation",
                         "inspect",
                     )
                 if not basis:
@@ -312,8 +405,7 @@ class ConnectionPort:
                 if actuator.content_path and "nativeScrollContentPath" not in self.capabilities:
                     raise local_failure(
                         "backend does not provide nativeScrollContentPath",
-                        "update the driver before selecting moving scroll content",
-                        "mode_unsupported",
+                        "unsupported_operation",
                         "inspect",
                     )
             query["actuator"] = actuator.wire()
@@ -328,8 +420,7 @@ class ConnectionPort:
             if capability not in self.capabilities:
                 raise local_failure(
                     "backend does not provide " + capability,
-                    "update the driver before selecting a related receiver",
-                    "mode_unsupported",
+                    "unsupported_operation",
                     "inspect",
                 )
             query["receiver"] = receiver.wire()
@@ -337,8 +428,7 @@ class ConnectionPort:
             if "nativeSelectionBasis" not in self.capabilities:
                 raise local_failure(
                     "backend does not provide nativeSelectionBasis",
-                    "update the driver before selecting a composed input target",
-                    "mode_unsupported",
+                    "unsupported_operation",
                     "inspect",
                 )
             query["basis"] = [entry.wire() for entry in basis]
@@ -374,6 +464,13 @@ class ConnectionPort:
                 action=p.get("action", {}).get("name"),
                 action_description=p.get("action", {}).get("description"),
                 click=decode_click_offer(p.get("click")),
+                global_input=Knowledge(p.get("globalInput", "unknown")),
+                keyboard_editing=p.get("keyboardEditing"),
+                preparation_impact=(
+                    PreparationImpact(**{key: Knowledge(item) for key, item in p["preparationImpact"].items()})
+                    if "preparationImpact" in p
+                    else None
+                ),
             )
             for p in value["primitives"]
         )
@@ -426,6 +523,9 @@ class ConnectionPort:
         follow_relations=None,
         focused_fields=None,
         primary_fields=None,
+        text_content=None,
+        focused_element=None,
+        strict_window=False,
     ):
         """Collect unified observation facts with their separate query scope."""
         from computer_use.protocol.observation.adapters import decode_driver_reply
@@ -440,9 +540,14 @@ class ConnectionPort:
             follow_relations=follow_relations,
             focused_fields=focused_fields,
             primary_fields=primary_fields,
+            text_content=text_content,
+            focused_element=focused_element,
+            strict_window=strict_window,
         )
         payload, facts = await self._nodes_payload(operation, target, request, timeout_ms)
         reply = decode_driver_reply(payload)
+        from computer_use.native.query.observed import capture_lookup_facts
+
         hints = {
             node["node"]: control_capabilities(self.platform, node, self.capabilities, scope_kind=scope_kind)
             for node in facts["nodes"]
@@ -453,6 +558,7 @@ class ConnectionPort:
                 reply.metadata,
                 operation_capabilities=hints,
                 input_containers={node["node"]: input_container(self.platform, node) for node in facts["nodes"]},
+                lookup_facts=capture_lookup_facts(facts),
             ),
         )
 
@@ -467,6 +573,32 @@ class ConnectionPort:
     ) -> tuple[Record, Record]:
         self._check(operation)
         query = dict(kind="nodes", fields=list(request.fields), maxNodes=request.max_nodes, maxDepth=request.max_depth)
+        focused_element = request.focused_element
+        if focused_element is not None:
+            if self.platform != "macos" or "nativeFocusedReadV1" not in self.connection.capabilities:
+                raise ValueError("This driver cannot collect a supplementary focused element")
+            if focused_element is not True and focused_element is not False:
+                raise ValueError("focused_element must be a boolean")
+            query["focusedElement"] = focused_element
+        if request.strict_window:
+            if self.platform != "windows" or "nativeStrictWindowRead" not in self.capabilities:
+                raise local_failure(
+                    "strict window collection requires a supporting Windows driver", "unsupported_operation"
+                )
+            query["strictWindow"] = True
+        if request.action_detail is not None:
+            if self.platform != "macos" or "nativeQueryActionProfile" not in self.connection.capabilities:
+                raise ValueError("This driver cannot select an action evidence profile")
+            if request.action_detail not in ("none", "names", "full"):
+                raise ValueError("Invalid action evidence profile")
+            query["actionDetail"] = request.action_detail
+        text_content = request.text_content
+        if text_content is not None:
+            if self.platform != "macos" or "nativeParameterizedText" not in self.connection.capabilities:
+                raise ValueError("This driver cannot capture parameterized native text")
+            if text_content is not True and text_content is not False:
+                raise ValueError("text_content must be a boolean")
+            query["textContent"] = text_content
         if request.primary_fields is not None:
             if "nativeUiaTextLines" not in self.connection.capabilities:
                 raise ValueError("This driver cannot limit line probing to primary text objects")
@@ -483,8 +615,14 @@ class ConnectionPort:
             if "nativeAdvertisedFields" not in self.connection.capabilities:
                 raise ValueError("This driver cannot query advertised native fields")
             query["advertisedFields"] = list(request.advertised_fields)
+        shares_attribute_catalogues = (
+            self.platform == "macos" and "nativeAttributeCataloguePool" in self.connection.capabilities
+            and (request.advertised_fields or request.follow_relations or request.text_content)
+        )
+        if shares_attribute_catalogues:
+            query["shareAttributeCatalogues"] = True
         if request.children_page is not None and request.relation_page is not None:
-            raise ValueError("Select one root relation page")
+            raise ValueError("Exactly one root relation page is required")
         page = request.relation_page if request.relation_page is not None else request.children_page
         property_name = (
             request.relation_page["property"] if request.relation_page is not None else self._children_property()
@@ -505,7 +643,6 @@ class ConnectionPort:
                         effect="none",
                         target="element content",
                         detail="The continuation is no longer retained for this element and relationship.",
-                        next="read the element again and use its reported continuation",
                     )
                 )
         result = await self.connection.request(
@@ -547,7 +684,7 @@ class ConnectionPort:
                         relation.get("offset", 0) != (expected[4] if expected else 0)
                         or expected is not None
                         and relation.get("total") != expected[5]
-                        or len(relation["targets"]) > page["limit"]
+                        or relation_slots(relation) > page["limit"]
                     )
                     else False
                 )
@@ -602,6 +739,38 @@ class ConnectionPort:
             raise ValueError("Event-assisted wait changed its observed session, window or token")
         return result
 
+    async def app_changes(self, operation, target, application, timeout_ms, *, after=None, delay_ms=None):
+        """Observe one App's native generation through a session read lease.
+
+        The old input Window may have closed. This query neither admits input
+        nor relies on its node/geometry/lifetime to observe its owning App.
+        """
+        self._check(operation)
+        if "nativeAppChangeEvents" not in self.capabilities:
+            raise ValueError("Application change observation requires nativeAppChangeEvents")
+        if any(
+            getattr(target, field) is not None for field in ("instance", "root_window", "surface", "node", "capture")
+        ):
+            raise ValueError("Application changes require a session discovery scope")
+        query = dict(kind="appChanges", application=application)
+        if after is not None:
+            valid_token = isinstance(after, str) and bool(after)
+            if not valid_token or type(delay_ms) is not int or not 1 <= delay_ms <= 400:
+                raise ValueError("Invalid application change token or event-wait limit")
+            query = dict(kind="waitAppChange", application=application, after=after, timeoutMs=delay_ms)
+        result = await self.connection.request(
+            "inspect",
+            dict(operation=operation, target=encode_fields(target, _BINDING), query=query),
+            dict(timeoutMs=timeout_ms),
+        )
+        if (
+            result["kind"] != query["kind"]
+            or result["session"] != target.session
+            or result["application"] != application
+        ):
+            raise ValueError("Application change observation changed its session or application")
+        return result
+
     def _children_property(self):
         from computer_use.native.semantics import RELATIONS
 
@@ -615,7 +784,7 @@ class ConnectionPort:
                     result["surface"],
                     relation["source"],
                     relation["property"],
-                    relation.get("offset", 0) + len(relation["targets"]),
+                    relation_end(relation),
                     relation["total"],
                 )
         while len(self._continuations) > 512:
@@ -667,7 +836,7 @@ class ConnectionPort:
         if (
             relation["source"] != target.node
             or relation["property"] != relation_property
-            or len(relation["targets"]) > limit
+            or relation_slots(relation) > limit
         ):
             raise ValueError("Native relation page changed its source, property or budget")
         if relation["state"] in ("complete", "partial"):
@@ -698,11 +867,30 @@ class ConnectionPort:
             raise ValueError("Native text page changed its requested range or budget")
         return page
 
-    async def capture(self, operation, target, max_dimension, timeout_ms, *, kind="window"):
+    async def prepare_observation(self, operation, target, timeout_ms):
         self._check(operation)
         value = await self.connection.request(
+            "prepareObservation",
+            dict(operation=operation, target=encode_fields(target, _BINDING)),
+            dict(timeoutMs=timeout_ms),
+        )
+        if decode_binding(value["binding"]) != target:
+            raise ValueError("Observation preparation changed its original window")
+        return value
+
+    async def capture(self, operation, target, max_dimension, timeout_ms, *, kind="window"):
+        self._check(operation)
+        parameters = {
+            "operation": operation,
+            "target": encode_fields(target, _BINDING),
+            "kind": kind,
+            "maxDimension": max_dimension,
+        }
+        if "nativeCaptureRetention" in self.capabilities:
+            parameters["retainedCaptures"] = sorted(self.capture_references)
+        value = await self.connection.request(
             "capture",
-            dict(operation=operation, target=encode_fields(target, _BINDING), kind=kind, maxDimension=max_dimension),
+            parameters,
             dict(timeoutMs=timeout_ms),
         )
         if (
@@ -712,8 +900,6 @@ class ConnectionPort:
             raise ValueError("Native capture changed its requested kind or scope")
         if kind == "desktop":
             dimensions = value["observation"]["canvas"]
-            if value["observation"]["mode"] != self.policy.mode:
-                raise ValueError("Native desktop capture changed its negotiated mode")
         else:
             dimensions = capture_metadata(value["image"])
         if max(dimensions["width"], dimensions["height"]) > max_dimension:
@@ -731,10 +917,9 @@ class ConnectionPort:
             and command.prepare
         ):
             raise ValueError("Click execution must use the negotiated integrated native contract")
-        if original != intent_key(dict(kind=command.intent.kind, parameters=dict(command.intent.parameters))):
+        if original != intent_key(self._intent_payload(command.intent)):
             raise local_failure(
                 "The operation intent is already bound; a step cannot change its parameters",
-                "finish this operation before requesting a different action",
                 "invalid_request",
                 "execute",
             )
@@ -745,8 +930,7 @@ class ConnectionPort:
         ):
             raise local_failure(
                 "backend does not provide nativeTextReplacement",
-                "update the driver before selecting a contextual replacement unit",
-                "mode_unsupported",
+                "unsupported_operation",
                 "execute",
             )
         if (
@@ -756,8 +940,7 @@ class ConnectionPort:
         ):
             raise local_failure(
                 "backend does not provide nativeElementPointer",
-                "update the driver before selecting an element pointer unit",
-                "mode_unsupported",
+                "unsupported_operation",
                 "execute",
             )
         if (
@@ -767,8 +950,7 @@ class ConnectionPort:
         ):
             raise local_failure(
                 "backend does not provide nativeControlParts",
-                "update the driver before selecting a pointer control member",
-                "mode_unsupported",
+                "unsupported_operation",
                 "execute",
             )
         if (
@@ -778,8 +960,7 @@ class ConnectionPort:
         ):
             raise local_failure(
                 "backend does not provide nativeElementScroll",
-                "update the driver before selecting an element wheel route",
-                "mode_unsupported",
+                "unsupported_operation",
                 "execute",
             )
         invalid_command = (
@@ -795,8 +976,7 @@ class ConnectionPort:
         if invalid_command:
             raise local_failure(
                 "backend does not provide nativeScrollContentPath",
-                "update the driver before selecting moving scroll content",
-                "mode_unsupported",
+                "unsupported_operation",
                 "execute",
             )
         wire = dict(
@@ -834,19 +1014,7 @@ class ConnectionPort:
             if matches_transport:
                 self.calls.retired = True
                 raise ValueError("Native selection receipt changed its negotiated transport")
-        return StepResult(
-            decode_binding(value["target"]),
-            Dispatch(value["dispatch"]),
-            value["detail"],
-            tuple(value["preparation"]),
-            Confirmation(value["confirmation"]),
-            Cleanup(value["cleanup"]),
-            value["errorCode"],
-            value["retryReason"],
-            value["context"],
-            value.get("application"),
-            decode_click_receipt(value.get("click")),
-        )
+        return decode_step_result(value)
 
     async def finish(self, operation):
         self._check(operation)

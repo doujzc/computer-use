@@ -10,6 +10,7 @@ an XTEST event to a window. Preparation cannot replay requested input.
 
 from copy import deepcopy
 
+from computer_use_linux.contracts.input_authority import require_global_input
 from computer_use_linux.contracts.protocol import Failure, fields, key_parts, require
 from computer_use_linux.control.native_selection import Changed
 from computer_use_linux.control.native_sequence_receiver import NativeSequenceReceiver
@@ -24,7 +25,7 @@ def keyboard_intent(value):
         p = fields(value["parameters"], ("key",))
         key_parts(p["key"])
     else:
-        raise Failure("Unsupported native keyboard intent.", "mode_unsupported")
+        raise Failure("Unsupported native keyboard intent.", "unsupported_operation")
     return deepcopy(value)
 
 
@@ -40,15 +41,19 @@ class NativeKeyboard:
     def prepare(self, operation, contract, foreground, ctx, preparation):
         from .keyboard.pipeline import NativePreparePipeline
 
-        return NativePreparePipeline(self.guard, self.route_key, self.desktop, self.target, self.b.mode).run(
+        return NativePreparePipeline(self.guard, self.route_key, self.desktop, self.target).run(
             operation, contract, foreground, ctx, preparation
         )
 
     def preflight(self, operation):
+        if operation.intent["kind"] == "focus":
+            # Receiver preparation uses addressed AT-SPI focus and window
+            # activation; it does not dispatch an XTEST keyboard sequence.
+            return
         require(
             getattr(self.desktop, "can_input", False),
             "This desktop has no implemented native keyboard route.",
-            "mode_unsupported",
+            "unsupported_operation",
         )
         if operation.intent["kind"] == "key":
             # Mapping failures must not move focus or dispatch part of a chord.
@@ -124,6 +129,13 @@ class NativeKeyboard:
             id=identifier,
             unit=unit,
             channel="keyboard",
+            globalInput=(
+                "no"
+                if operation.intent["kind"] == "focus"
+                or operation.intent["kind"] == "paste"
+                and not operation.intent["parameters"]["text"]
+                else "yes"
+            ),
             supported="yes" if supported else "no",
             readiness="yes" if r["ready"] else "no",
             pending=pending,
@@ -184,6 +196,8 @@ class NativeKeyboard:
         dispatch, confirmation, error_code, retry = "notDispatched", "unavailable", None, None
         detail = "Keyboard input was not dispatched."
         try:
+            if operation.intent["kind"] != "focus":
+                require_global_input(self.desktop)
             self.ax.begin(ctx)
             self.preflight(operation)
             if preparing:

@@ -1,13 +1,14 @@
 # coding: utf-8
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 
-"""Exclusive keyboard input bound to an observed desktop's native window.
+"""Keyboard input bound to an observed desktop's native window.
 
 No activation, receiver preparation or retry is performed. Existing optional
 AX information can pin the receiver; it is never required to start a visual
 route. X11 sequences own key mapping, literal text planning and paired release.
 """
 
+from computer_use_linux.contracts.input_authority import require_global_input
 from computer_use_linux.contracts.protocol import Failure, key_parts, require
 from computer_use_linux.control.native_sequence_receiver import NativeSequenceReceiver
 from computer_use_linux.control.native_target import NativeTarget
@@ -21,9 +22,10 @@ class NativeDesktopInput:
 
     def guard(self, operation, target, ctx):
         ctx.check()
-        require(self.b.mode == "exclusive", "Desktop-wide keyboard input requires exclusive mode.", "mode_unsupported")
         require(
-            getattr(self.desktop, "can_input", False), "This desktop has no native keyboard route.", "mode_unsupported"
+            getattr(self.desktop, "can_input", False),
+            "This desktop has no native keyboard route.",
+            "unsupported_operation",
         )
         require(
             operation.intent["kind"] in ("key", "insert")
@@ -53,6 +55,9 @@ class NativeDesktopInput:
             id=identifier,
             unit="key_sequence",
             channel="keyboard",
+            globalInput=(
+                "no" if operation.intent["kind"] == "insert" and not operation.intent["parameters"]["text"] else "yes"
+            ),
             supported="yes",
             readiness="yes",
             pending=[],
@@ -78,6 +83,8 @@ class NativeDesktopInput:
         dispatch, error_code, cleanup, confirmation = "notDispatched", None, "complete", "unavailable"
         detail = "Desktop keyboard input was not dispatched."
         try:
+            if operation.intent["kind"] != "insert" or operation.intent["parameters"]["text"]:
+                require_global_input(self.desktop)
             destination = self.guard(operation, target, ctx)
             self.preflight(operation)  # Entire payload, before any key event.
             self.guard(operation, target, ctx)

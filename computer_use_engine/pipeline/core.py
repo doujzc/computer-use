@@ -112,8 +112,8 @@ class Control:
     individual stages consult when needed.
 
     Attributes:
-        remaining: Callback returning milliseconds left on the call; may raise
-            on expiration.
+        remaining: Callback returning milliseconds left, or None when no total
+            deadline is set; may raise on expiration or cancellation.
         cancelled: Optional cancellation predicate supplied by the call owner.
         diagnostic: Optional event sink whose exceptions are isolated from execution.
         path: Diagnostic path through the declared flow nodes.
@@ -122,7 +122,7 @@ class Control:
         branch: Label of the selected branch.
     """
 
-    remaining: Callable[[], int] | None = None
+    remaining: Callable[[], int | None] | None = None
     cancelled: Callable[[], bool] | None = None
     diagnostic: Callable[[Event], None] | None = None
     path: tuple[str, ...] = ()
@@ -425,7 +425,7 @@ class Sequence(Node[T, U]):
             *positional_steps: Ordered child steps, mutually exclusive with steps=.
         """
         if steps is not None and positional_steps:
-            raise TypeError("Use either positional steps or steps=, not both")
+            raise TypeError("Positional steps and steps= are mutually exclusive")
         self.steps = tuple(positional_steps if steps is None else steps)
         super().__init__(name, _composite(self.steps))
 
@@ -530,7 +530,7 @@ class Repeat(Node[T, V]):
             bounded_by: Name of the domain budget when no iteration limit is set.
         """
         if advance is not None and on_decision is not None:
-            raise TypeError("Use either advance or on_decision=, not both")
+            raise TypeError("advance and on_decision= are mutually exclusive")
         if on_decision is not None:
             advance = on_decision
         if gate.contract.effects - {Effect.PURE}:
@@ -605,7 +605,7 @@ class Scope(Node[T, U]):
             using: Keyword form of ``factory``; supply one of the two.
         """
         if factory is not None and using is not None:
-            raise TypeError("Use either factory or using=, not both")
+            raise TypeError("factory and using= are mutually exclusive")
         if using is not None:
             factory = using
         if factory is None or body is None:

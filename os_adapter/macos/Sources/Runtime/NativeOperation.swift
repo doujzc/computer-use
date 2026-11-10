@@ -11,6 +11,7 @@ import Foundation
     let writable: Bool
     let request: NativeIntent
     let clickContract: String?
+    /// Advisory wire metadata is emitted only for an explicitly opted-in client.
     var intent: String { request.kind }
     let target: [String: Any]
     private(set) var state = State.active
@@ -18,6 +19,9 @@ import Foundation
     private(set) var stopReason: String?
     private(set) var cleanup = "complete"
     private(set) var inputStarted = false
+    private(set) var appChangeInputBaseline: NativeAppObserver.Stamp?
+    private let appChangeBaseline: NativeAppObserver.Stamp?
+    private let sampleAppChange: @MainActor () -> NativeAppObserver.Stamp?
     /// Non-controlling observers follow the complete public operation, across
     /// its inspect/prepare/execute RPCs, including expiry and cancellation.
     var onClose: ((Bool) -> Void)?
@@ -30,6 +34,14 @@ import Foundation
     private var inputReferences = [String: () -> Void]()
     private var unavailableBackgroundPreparation = Set<String>()
     private var confirmedPreparation = Set<String>()
+    private(set) var keyboardInsertionSelection: NativeTextSelection?
+    private(set) var geckoTextProvider: NativeGeckoTextProvider.Proof?
+    /// The operation owns original document evidence independently of the
+    /// currently declared AX capability list.
+    let actionDocuments = NativeActionDocumentContexts()
+    /// This optional coordinate optimization is retired only for this public
+    /// operation after a proven no-effect failure. It never becomes app state.
+    let coordinateMenuPressAttempt = NativeCoordinateMenuPress.Attempt()
     private struct ClickAuthority {
         let target: [String: Any]
         let within: [String]
@@ -38,11 +50,17 @@ import Foundation
     }
     private var clickAuthorities = [ClickAuthority]()
     private var clickPreparationRequiresObservation = false
+    private(set) var didRevealClippedClickLeaf = false
+    private var foregroundResponsibility: NativeForegroundResponsibility?
+    var onForegroundClose: ((NativeForegroundResponsibility, Bool) -> Bool)?
     private let cancelActive: () -> Void
     private let now: () -> TimeInterval
 
     init(
         timeoutMs: Int, writable: Bool, intent: NativeIntent, target: [String: Any], clickContract: String? = nil,
+        appChangeBaseline: NativeAppObserver.Stamp? = nil,
+        sampleAppChange: @escaping @MainActor () -> NativeAppObserver.Stamp? = { nil },
+        foregroundResponsibility: NativeForegroundResponsibility? = nil,
         now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }, release: @escaping () -> Void,
         cancelActive: @escaping () -> Void
     ) {
@@ -52,6 +70,9 @@ import Foundation
         self.request = intent
         self.target = target
         self.clickContract = clickContract
+        self.appChangeBaseline = appChangeBaseline
+        self.sampleAppChange = sampleAppChange
+        self.foregroundResponsibility = foregroundResponsibility
         self.release = release
         self.cancelActive = cancelActive
         timer = Task { @MainActor [weak self] in
@@ -73,12 +94,48 @@ import Foundation
         try Task.checkCancellation()
     }
 
+    func inheritForeground(_ owner: NativeForegroundResponsibility) -> Bool {
+        guard !request.globalInput, writable, foregroundResponsibility == nil else { return false }
+        guard owner.resume(check: { [weak self] in
+            guard let self else { throw CancellationError() }
+            try self.check(write: true)
+            try RequestDiagnostics.checkCancellation()
+        }) else { return false }
+        foregroundResponsibility = owner
+        return true
+    }
+
     /// One public operation may prepare its receiver in several units, but may
     /// cross the requested-input barrier only once. A compound unit (drag, text
     /// sequence) owns all its events and releases inside that one dispatch.
-    func recordInputDispatch() { inputStarted = true }
+    func recordInputDispatch() {
+        if !inputStarted, let armed = appChangeBaseline, let current = sampleAppChange(),
+            current.session == armed.session, current.application == armed.application,
+            current.incarnation == armed.incarnation {
+            appChangeInputBaseline = current
+        }
+        // Compound keys/pointer trains retain the first requested-input epoch.
+        // Preparation records never enter this barrier.
+        inputStarted = true
+        foregroundResponsibility?.recordRequestedInput()
+    }
+
+    /// Preparation owns helper cleanup even when no requested input is sent.
+    func recordUnconfirmedCleanup() { cleanup = "unknown" }
 
     func preparationConfirmed(_ primitive: String) -> Bool { confirmedPreparation.contains(primitive) }
+
+    /// The initial proved caret/selection belongs to the immutable addressed
+    /// insertion. Later preparation or inspection may confirm it, never move it.
+    func retainKeyboardInsertionSelection(_ selection: NativeTextSelection) {
+        if keyboardInsertionSelection == nil { keyboardInsertionSelection = selection }
+    }
+
+    /// A live provider sample can qualify a route. Temporary loss of that
+    /// sample must not revive a setter already excluded for this original edit.
+    func retainGeckoTextProvider(_ proof: NativeGeckoTextProvider.Proof) {
+        if geckoTextProvider == nil { geckoTextProvider = proof }
+    }
 
     func confirmPreparation(_ primitive: String) throws {
         try check(write: true)
@@ -102,11 +159,8 @@ import Foundation
         try backgroundPreparationUnavailable(primitive)
     }
 
-    func requireForegroundPreparation(_ primitive: String, hostAllowed: Bool) throws {
+    func requireForegroundPreparation(_ primitive: String) throws {
         try check(write: true)
-        guard hostAllowed else {
-            throw DriverError("foreground assistance is not enabled by this host", code: .modeUnsupported)
-        }
         guard !inputStarted, unavailableBackgroundPreparation.contains(primitive) else {
             throw DriverError(
                 """
@@ -128,18 +182,13 @@ import Foundation
     }
 
     func requireClickForeground(
-        target: [String: Any], within: [String], backgroundFamily: String?, backgroundUnavailable: Bool,
-        hostAllowed: Bool, exclusive: Bool
+        target: [String: Any], within: [String], backgroundFamily: String?, backgroundUnavailable: Bool
     ) throws {
         try check(write: true)
         guard clickContract != nil, !inputStarted, !clickPreparationRequiresObservation else {
             throw DriverError(
                 "click already produced input or incompatible preparation", code: .executionUnknown, effect: .possible)
         }
-        guard hostAllowed else {
-            throw DriverError("foreground assistance is not enabled by this host", code: .modeUnsupported)
-        }
-        if exclusive { return }
         let recorded =
             backgroundFamily.map { family in
                 clickAuthorities.contains {
@@ -151,6 +200,15 @@ import Foundation
             throw DriverError(
                 "foreground click requires original-scope background unavailability evidence", code: .invalidRequest)
         }
+    }
+
+    func recordClippedClickLeafReveal() { didRevealClippedClickLeaf = true }
+
+    /// The exact-hit obligation belongs to the input target fixed before the
+    /// AX side effect. A read of another node does not inherit that obligation.
+    func requiresRevealedLeafHit(_ value: [String: Any], within: [String]) -> Bool {
+        guard didRevealClippedClickLeaf, let inputTarget, inputWithin == within else { return false }
+        return NSDictionary(dictionary: inputTarget).isEqual(to: value)
     }
 
     func blockClickContinuation() { clickPreparationRequiresObservation = true }
@@ -233,7 +291,9 @@ import Foundation
 
     /// The result contains the unit's effect journal even on native failure.
     /// Protocol validation happens before admission; unit failures are values.
-    func execute(step: Int64, payload: Data, body: () async -> [String: Any]) async throws -> [String: Any] {
+    func execute(
+        step: Int64, payload: Data, candidateID: String? = nil, body: () async -> [String: Any]
+    ) async throws -> [String: Any] {
         // A duplicate completed step can be retrieved after finish/expiry. It
         // must never re-enter a native API, including after result eviction.
         switch steps.begin(id: step, request: payload) {
@@ -264,7 +324,7 @@ import Foundation
             }
             guard !clickPreparationRequiresObservation else {
                 throw DriverError(
-                    "preparation changed or may have changed the original click context; observe before continuing",
+                    "preparation changed or may have changed the original click context",
                     code: .executionUnknown, effect: .possible)
             }
         } catch {
@@ -285,7 +345,17 @@ import Foundation
             busy = false
             if state == .stopping { close() }
         }
-        let result = await body()
+        if !request.globalInput, foregroundResponsibility == nil {
+            foregroundResponsibility = NativeForegroundResponsibility(check: { [weak self] in
+                guard let self else { throw CancellationError() }
+                try self.check(write: true)
+                try RequestDiagnostics.checkCancellation()
+            })
+        }
+        foregroundResponsibility?.beginCandidate(candidateID)
+        let result = await NativeForegroundResponsibility.$current.withValue(foregroundResponsibility) {
+            await body()
+        }
         // Defensive sealing also covers a unit that reported dispatch but
         // omitted its early barrier. Invalid results quarantine the executor.
         guard let dispatch = result["dispatch"] as? String,
@@ -313,7 +383,7 @@ import Foundation
             cleanup = "unknown"
             stop("invalid_native_result")
             throw DriverError(
-                "native result could not be retained; do not replay input", code: .executionUnknown, effect: .possible)
+                "native result could not be retained", code: .executionUnknown, effect: .possible)
         }
     }
 
@@ -334,6 +404,10 @@ import Foundation
     private func close() {
         guard !busy, state != .closed else { return }
         state = .closed
+        if let owner = foregroundResponsibility,
+            onForegroundClose?(owner, stopReason == "finished" && cleanup == "complete") != true { owner.stop() }
+        onForegroundClose = nil
+        actionDocuments.clear()
         timer?.cancel()
         timer = nil
         let notify = onClose

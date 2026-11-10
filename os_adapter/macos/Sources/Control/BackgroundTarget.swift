@@ -30,7 +30,6 @@ import ApplicationServices
 
 /// A process identity from an observation, never a lookup of the current foreground app.
 @MainActor struct BackgroundTarget {
-    private static let desktopMode = ProcessInfo.processInfo.environment["COMPUTER_USE_DESKTOP"] ?? "shared"
     let application: NSRunningApplication
     let launched: Date?
     private let nativeIdentity: NativeProcessIdentity?
@@ -39,45 +38,44 @@ import ApplicationServices
     private let owner: NSRunningApplication?
     private let ownerIdentity: NativeProcessIdentity?
 
-    static var isExclusive: Bool { desktopMode == "exclusive" }
     var isForeground: Bool {
         NSWorkspace.shared.frontmostApplication?.processIdentifier == application.processIdentifier
     }
-    var allowsMenuPopup: Bool { Self.isExclusive || isForeground }
     var capturedProcessIdentity: NativeProcessIdentity? { nativeIdentity }
 
     static func validateDesktop(input: Bool = false) throws {
         let foreground = NSWorkspace.shared.frontmostApplication
-        guard foreground?.bundleIdentifier != "com.apple.loginwindow", !input || foreground != nil else {
-            // Preserve the actual evidence behind a desktop refusal. A missing
-            // foreground or loginwindow is not proof of a particular lock setting.
-            let session = CGSessionCopyCurrentDictionary() as? [String: Any] ?? [:]
-            func state(_ key: String) -> String { session[key].map { String(describing: $0) } ?? "unknown" }
-            diagnose(
-                """
-                desktop unavailable: foreground=\(foreground?.bundleIdentifier ?? "none") \
-                pid=\(foreground?.processIdentifier ?? 0), \
-                displayAsleep=\(CGDisplayIsAsleep(CGMainDisplayID())), \
-                loginDone=\(state("kCGSessionLoginDoneKey")), onConsole=\(state("kCGSessionOnConsoleKey")), \
-                screenLocked=\(state("CGSSessionScreenIsLocked"))
-                """)
-            let reason = foreground == nil ? "foreground application unavailable" : "login window is in the foreground"
-            throw DriverError(
-                "desktop unavailable: \(reason)", code: .desktopUnavailable,
-                next: "resume the desktop session before continuing")
-        }
+        let systemUI = foreground?.bundleIdentifier == "com.apple.loginwindow"
+        guard systemUI || (input && foreground == nil) else { return }
+        let session = CGSessionCopyCurrentDictionary() as? [String: Any] ?? [:]
+        if systemUI && permitsLoginWindowInterface(session) { return }
+
+        func state(_ key: String) -> String { session[key].map { String(describing: $0) } ?? "unknown" }
+        diagnose(
+            """
+            desktop unavailable: foreground=\(foreground?.bundleIdentifier ?? "none") \
+            pid=\(foreground?.processIdentifier ?? 0), \
+            displayAsleep=\(CGDisplayIsAsleep(CGMainDisplayID())), \
+            loginDone=\(state(kCGSessionLoginDoneKey)), onConsole=\(state(kCGSessionOnConsoleKey)), \
+            screenLocked=\(state("CGSSessionScreenIsLocked"))
+            """)
+        let reason = systemUI ? "login window is in the foreground and session availability is unconfirmed"
+            : "foreground application unavailable"
+        throw DriverError("desktop unavailable: \(reason)", code: .desktopUnavailable)
     }
 
-    static func validateReleasedInput(allowing button: CGMouseButton? = nil) throws {
-        let modifiers: CGEventFlags = [.maskCommand, .maskControl, .maskAlternate, .maskShift]
-        guard CGEventSource.flagsState(.combinedSessionState).intersection(modifiers).isEmpty,
-            ![CGMouseButton.left, .right, .center].contains(where: {
-                $0 != button && CGEventSource.buttonState(.combinedSessionState, button: $0)
-            })
-        else {
-            throw DriverError(
-                "mouse buttons or modifiers are already held; release them before input", code: .inputUnavailable)
+    /// loginwindow can own ordinary system dialogs in an active user session.
+    /// The private lock flag is normally absent in that case. Only use this
+    /// convention with affirmative, typed public login and console facts.
+    static func permitsLoginWindowInterface(_ session: [String: Any]) -> Bool {
+        func matches(_ value: Any?, _ expected: Bool) -> Bool {
+            guard let value, CFGetTypeID(value as CFTypeRef) == CFBooleanGetTypeID() else { return false }
+            return value as? Bool == expected
         }
+        guard matches(session[kCGSessionLoginDoneKey], true), matches(session[kCGSessionOnConsoleKey], true)
+        else { return false }
+        let locked = session["CGSSessionScreenIsLocked"]
+        return locked == nil || matches(locked, false)
     }
 
     enum MenuRecipient { case window(AXUIElement), application }
@@ -141,9 +139,6 @@ import ApplicationServices
         // Cancellation stops further input, but identity-only checks used by
         // key/button release must remain available while the task unwinds.
         if input { try RequestDiagnostics.checkCancellation() }
-        guard ["shared", "exclusive"].contains(Self.desktopMode) else {
-            throw DriverError("COMPUTER_USE_DESKTOP must be shared or exclusive", code: .modeUnsupported)
-        }
         // Preserve the original short-circuit order. Construct diagnostic fields
         // only on failure, from the exact values this validation evaluated.
         // In particular, a later lookup must not replace missing process data.
@@ -181,8 +176,8 @@ import ApplicationServices
                 check == "currentApplication"
                 ? "application registration is unavailable and has not been confirmed for this process lifetime"
                 : readFailure != nil
-                    ? "target process identity could not be read; read the app again"
-                    : "target process exited or changed; read the app again"
+                    ? "target process identity could not be read"
+                    : "target process exited or changed"
             return DriverError(detail, code: .staleTarget)
         }
         guard !terminated else { throw identityFailure("isTerminated") }
@@ -235,7 +230,7 @@ import ApplicationServices
                 NativeWindows.belongs(nativeIdentity, to: owner)
             else {
                 throw DriverError(
-                    "auxiliary window no longer belongs to the observed app; read the app again", code: .staleTarget)
+                    "auxiliary window no longer belongs to the observed app", code: .staleTarget)
             }
         }
         if input { try Self.validateDesktop(input: true) }

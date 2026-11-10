@@ -10,7 +10,7 @@ import ApplicationServices
         resource: NativeResourceAccess, query: NativeQueryAccess, control: NativeControlAccess,
         launch: NativeLaunchAccess
     ) async throws -> [String: Any] {
-        if ["inspect", "capture", "execute"].contains(method) {
+        if ["inspect", "capture", "prepareObservation", "execute"].contains(method) {
             let op = try operation((raw as? [String: Any])?["operation"])
             let deadline = ResolveNativeRequestDeadlinePass.run(op, enclosing: RequestDiagnostics.deadline)
             return try await RequestDiagnostics.$deadline.withValue(deadline) {
@@ -40,8 +40,16 @@ import ApplicationServices
     ) async throws -> [String: Any] {
         switch method {
         case "begin": return try await NativeResourceScope.begin(raw, timeoutMs: timeoutMs, access: resource)
+        case "locatePoint": return try resource.scopes.locatePoint(raw)
         case "capture": return try await CapturePipeline.collect(raw, operation: operation, scopes: resource.scopes)
-        case "inspect": return try ReadPipeline.collect(raw, operation: operation, access: query)
+        case "prepareObservation":
+            return try await ObservationPreparationPipeline.run(raw, operation: operation, scopes: resource.scopes)
+        case "inspect":
+            let kind = ((raw as? [String: Any])?["query"] as? [String: Any])?["kind"] as? String
+            if kind == "appChanges" || kind == "waitAppChange" {
+                return try await NativeAppChangePipeline.collect(raw, operation: operation, access: query)
+            }
+            return try ReadPipeline.collect(raw, operation: operation, access: query)
         case "execute":
             return try await ControlPipeline.execute(raw, operation: operation, access: control, launch: launch)
         case "finish": return try await NativeResourceScope.finish(raw, operation: operation)

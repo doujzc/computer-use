@@ -160,7 +160,7 @@ def query(value):
             )
         decode_selection_request(value)
     else:
-        raise Failure("This Linux v6 driver does not implement inspect " + str(kind) + ".", "mode_unsupported")
+        raise Failure("This Linux v6 driver does not implement inspect " + str(kind) + ".", "unsupported_operation")
     return value
 
 
@@ -175,7 +175,7 @@ class NativeExecution:
         self.text = NativeText(backend, self.store, self.directory)
         self.action = NativeAction(backend, self.store, self.directory, self.facts)
         self.captures = NativeCapture(backend, self.directory)
-        self.keyboard_recipients = NativeKeyboardRecipients()
+        self.keyboard_recipients = NativeKeyboardRecipients(backend.ax.native_key)
         self.element_pointer = NativeElementPointer(backend, self.store, self.directory, self.captures)
         self.keyboard = NativeKeyboard(backend, self.store, self.directory, recipients=self.keyboard_recipients)
         self.typed_text = NativeTypedText(
@@ -202,7 +202,7 @@ class NativeExecution:
             ]
             if getattr(backend.desktop, "can_capture", False):
                 self.capabilities += ["nativePointer", "nativeDesktopInput"]
-        backend.ax.focus_lost = self.keyboard_recipients.clear
+        backend.ax.focus_lost = self.keyboard_recipients.focus_lost
         self.resources = NativeResourceScope(
             store=self.store,
             coordinate=backend.coordinate,
@@ -306,7 +306,7 @@ class NativeExecution:
                     or target["surface"] is None
                     and intent["kind"] in ("key", "insert"),
                     "Image input supports pointer intents; captured desktop also supports keys and text insertion.",
-                    "mode_unsupported",
+                    "unsupported_operation",
                 )
             if writable and not launch:
                 decoder = (
@@ -333,11 +333,6 @@ class NativeExecution:
             )
             if not launch and target["capture"] is not None:
                 self.captures.input(target)
-                require(
-                    target["surface"] is not None or self.b.mode == "exclusive",
-                    "Desktop-wide input requires exclusive mode.",
-                    "mode_unsupported",
-                )
             self.expire()
             require(self.current is None, "Another native operation is active.")
             if not launch and target["surface"] is not None:
@@ -350,12 +345,12 @@ class NativeExecution:
             return self.capture_pipeline.run(params, ctx)
         if method == "execute":
             return self.inputs.run(params, ctx)
-        require(method == "inspect", "This Linux v6 driver has no " + str(method) + " unit.", "mode_unsupported")
+        require(method == "inspect", "This Linux v6 driver has no " + str(method) + " unit.", "unsupported_operation")
         return self.queries.run(params, ctx)
 
     def close(self):
         self.keyboard_recipients.clear()
-        if getattr(self.b.ax, "focus_lost", None) == self.keyboard_recipients.clear:
+        if getattr(self.b.ax, "focus_lost", None) == self.keyboard_recipients.focus_lost:
             self.b.ax.focus_lost = None
         if self.current:
             self.finish(self.current.token)

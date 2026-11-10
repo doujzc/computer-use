@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from types import MappingProxyType
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 from computer_use.interaction.read.delivery.model import PURE, ObservationDraft
 from computer_use.pipeline import Contract, Pass
@@ -24,7 +24,8 @@ def assemble(draft: ObservationDraft, control: Control) -> AppObservation:
 
     acquired = draft.source.acquired
     plan, components = acquired.plan, acquired.components
-    cast("Callable[[], int]", control.remaining)()
+    # Delivery only assembles captured evidence. The deadline prevents new
+    # queries; it must not erase a tree or image after acquisition completed.
     return AppObservation(
         selection=plan.selection,
         target=acquired.target,
@@ -41,6 +42,7 @@ def assemble(draft: ObservationDraft, control: Control) -> AppObservation:
         launch=plan.launch,
         menus=components.menus,
         overview=draft.overview,
+        snapshots_numbered=draft.source.snapshots_numbered,
     )
 
 
@@ -49,5 +51,3 @@ stage = Pass.define(
     function=assemble,
     contract=Contract(ObservationDraft, object, PURE),
 )
-if TYPE_CHECKING:
-    from typing import Callable

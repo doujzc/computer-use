@@ -6,7 +6,7 @@ Integrate Computer Use DeepAgent into an application, or add its desktop tools t
 
 ## 1. Prepare the environment
 
-Install Python 3.12 or 3.13 and `uv`. Build and run the desktop operation service on the computer whose desktop it will operate.
+Install Python 3.11, 3.12 or 3.13 and `uv`. Build and run the desktop operation service on the computer whose desktop it will operate.
 
 Prepare the native dependencies on the computer whose desktop you will operate:
 
@@ -30,7 +30,7 @@ cd computer-use
 uv sync --python 3.12 --no-dev --extra agent
 ```
 
-The SDK, MCP and Agent code are installed in editable mode into the checkout's `.venv`, together with openJiuwen and other Agent dependencies. This command explicitly selects Python 3.12; Python 3.13 is also supported. Run the following commands from the checkout root.
+The SDK, MCP and Agent code are installed in editable mode into the checkout's `.venv`, together with openJiuwen and other Agent dependencies. This command selects Python 3.12. Use `--python 3.11` or `--python 3.13` to match an existing environment. Run the following commands from the checkout root.
 
 Build or prepare the native backend, then check desktop access:
 
@@ -43,7 +43,7 @@ On macOS, use `uv run --no-dev --extra agent computer-use-permissions --request`
 
 ## 3. Create a desktop agent
 
-For a wheel installation, select the `agent` extra.
+For a wheel installation, select the `agent` extra instead; it includes MCP.
 
 Configure a model that supports tool calls and image input using openJiuwen's `ModelClientConfig` and `ModelRequestConfig`. The example reads the provider, endpoint, credentials and model name from `MODEL_PROVIDER`, `API_BASE`, `API_KEY` and `MODEL_NAME`.
 
@@ -85,11 +85,11 @@ uv run --no-dev --extra agent python desktop_agent.py
 
 First check application enumeration, then use the streaming call to inspect actual window text and screenshots. Enumeration only verifies local backend calls; desktop access also requires the relevant permissions and successful observations.
 
-The agent operates the local desktop in `exclusive` mode by default. Pass `config=AgentConfig(desktop="shared")` to select shared mode, or configure `AgentConfig.mcp` with `McpConfig` to connect to another MCP host. The async context manager closes the computer-operation session when the conversation ends.
+`AgentConfig.allow_global_input` defaults to `True`. Set it to `False` to restrict global input in the local MCP session. Set `AgentConfig.mcp` to a `McpConfig` to connect to another MCP host. The async context manager closes the computer-operation session when the conversation ends.
 
 ## 4. Integrate an existing openJiuwen project
 
-The host project must also use Python 3.12 or 3.13. In its directory, add this checkout as an editable dependency to the host environment:
+The host project must also use Python 3.11, 3.12 or 3.13. In its directory, add this checkout as an editable dependency to the host environment:
 
 ```bash
 uv add --editable /absolute/path/to/computer-use --extra agent
@@ -134,4 +134,4 @@ Run `uv run --extra agent computer-use-agent --help` for CLI options.
 
 After changing Python source, restart the host application or recreate the Agent/Toolkit session. After dependency or entry-point changes, rerun `uv sync --no-dev --extra agent` in the checkout and update the host project dependencies. After native backend changes, run `uv run --no-dev --extra agent computer-use-build`, then restart the session.
 
-See the [MCP interface reference](mcp.en.md#4-interface-reference) for engine calls and observations.
+See the [MCP interface reference](mcp.en.md#4-interface-reference) for engine calls and observations, and the [packaging guide](../PACKAGING.md) for development packages.

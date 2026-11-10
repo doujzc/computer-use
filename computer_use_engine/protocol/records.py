@@ -10,6 +10,7 @@ variants. Field status records preserve absent and failed reads explicitly.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any, Literal, NotRequired, TypeAlias, TypedDict
 
 Record: TypeAlias = dict[str, Any]
@@ -63,6 +64,9 @@ class NativeRelation(TypedDict):
         offset: Starting target index for this page.
         total: Full target count when reported by the provider.
         detail: Provider explanation of incomplete or conflicting evidence.
+        membershipObservedAt: Capture interval of retained relationship members; not current membership.
+        inspectedCount: Number of checked native slots, including unavailable objects.
+        unavailablePositions: Absolute positions checked without a usable object reference.
     """
 
     source: str
@@ -74,6 +78,19 @@ class NativeRelation(TypedDict):
     offset: NotRequired[int]
     total: NotRequired[int]
     detail: NotRequired[str]
+    membershipObservedAt: NotRequired[Record]
+    inspectedCount: NotRequired[int]
+    unavailablePositions: NotRequired[list[int]]
+
+
+def relation_slots(relation: Mapping[str, Any]) -> int:
+    """Count the checked native slots rather than the references they supplied."""
+    return relation.get("inspectedCount", len(relation["targets"]))
+
+
+def relation_end(relation: Mapping[str, Any]) -> int:
+    """Return the first uninspected native slot."""
+    return relation.get("offset", 0) + relation_slots(relation)
 
 
 class FactCollection(TypedDict):
@@ -130,6 +147,13 @@ class ApplicationInfo(TypedDict):
     windows: NotRequired[list[Record]]
 
 
+class SurfaceContent(TypedDict):
+    kind: Literal["window", "menu", "popup", "application", "unknown"]
+    host: str | None
+    evidence: str
+    hostNode: NotRequired[str | None]
+
+
 class SurfaceInfo(TypedDict):
     """One decoded surface; relationship certainty stays explicit.
 
@@ -156,8 +180,23 @@ class SurfaceInfo(TypedDict):
     parent: str | None
     parentState: Literal["known", "none", "unknown"]
     modal: bool | None
+    content: NotRequired[SurfaceContent]
     nativeWindow: bool
     accessibility: bool
+
+
+class DesktopWindowInfo(TypedDict):
+    """Desktop geometry plus an optional exact, retained directory identity.
+
+    Platforms that cannot retain a native window identity still deliver their
+    visible catalogue row. A title/frame never substitutes for ``window``.
+    """
+
+    app: str
+    title: str
+    rect: Record
+    selector: NotRequired[str]
+    window: NotRequired[SurfaceInfo]
 
 
 NativeDirectory: TypeAlias = Record
@@ -165,7 +204,16 @@ NativeDirectory: TypeAlias = Record
 
 All variants retain session/platform/observed/stopReasons. The selected kind
 adds applications, surfaces, or roots; a surface/root directory's application
-field is an identity string. The existing query/schema determines the variant.
+field is an identity string. Windows running-window directories may publish
+nativeProcessNames when primary Win32 enumeration and identity retention
+completed. Each pair associates a process name with a native application ID.
+Surface directories also publish
+rootDiscoveryComplete: whether independent-root discovery and relationships
+are complete, independently of attached-content discovery. stopReasons retain
+diagnostic details and full-catalogue gaps; their wording does not select a root.
+macOS and Windows endedWindows carries positive native/process end evidence independently
+of visible catalogue completeness; a hidden window's absence is not its end.
+The existing query/schema determines the variant.
 """
 
 

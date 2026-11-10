@@ -8,13 +8,14 @@ import inspect
 import sys
 import types
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict
 from pathlib import Path
 from time import monotonic
 from types import MappingProxyType
-from typing import Awaitable, Callable
 
 from computer_use import Computer
+from computer_use.client.execution import ExecutionCancellation, execution_scope
 from computer_use.errors import ComputerUseError
 
 from .admission import Registry, fingerprint
@@ -29,18 +30,20 @@ class _Refused(Exception):
 class ProgramContext:
     """Own only this invocation's checks, deadline and cross-step evidence.
 
-    Task code declares read-only checks and SDK actions explicitly. A reviewed
-    Python program is trusted code, not a security-isolated interpreter. Sink
-    errors stop execution; the host's checkpoint must raise on delivery failure.
+    Task code declares read-only checks and wraps synchronous SDK calls in steps.
+    A reviewed Python program is trusted code, not a security-isolated
+    interpreter. Sink errors stop execution; the host's checkpoint must raise
+    on delivery failure.
     """
 
-    def __init__(self, artifact, parameters, timeout_s, emit, checkpoint, observe_environment):
+    def __init__(self, artifact, parameters, timeout_s, emit, checkpoint, observe_environment, executor):
         self.started = monotonic()
         self.deadline = self.started + timeout_s
         self.id, self.program = str(uuid.uuid4()), artifact.definition
         self.scope, self.expected_sha256 = artifact.expectation(parameters)
         self.emit, self.checkpoint = emit, checkpoint
         self.observe_environment = observe_environment
+        self._executor = executor
         self.steps, self.checks, self.confirmed = [], [], []
         self.current, self.write_started = None, False
         self._failure, self._owner = None, asyncio.current_task()
@@ -84,6 +87,32 @@ class ProgramContext:
             raise
         self.confirmed.append(condition)
 
+    async def _invoke(self, operation):
+        if inspect.iscoroutinefunction(operation):
+            return await operation()
+        cancellation = ExecutionCancellation()
+
+        def call():
+            with execution_scope(self._executor, cancellation):
+                return operation()
+
+        # Synchronous SDK operations must leave their owning event loop free.
+        worker = asyncio.create_task(asyncio.to_thread(call))
+        try:
+            value = await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            cancellation.cancel()
+            # Repeated cancellation must still wait for native retirement.
+            while not worker.done():
+                try:
+                    await asyncio.wait((worker,))
+                except asyncio.CancelledError:
+                    continue
+            if not worker.cancelled():
+                worker.exception()
+            raise
+        return await value if inspect.isawaitable(value) else value
+
     async def step(self, name, operation, *, write=False):
         self.ensure_active()
         self.current = name
@@ -95,7 +124,7 @@ class ProgramContext:
             if monotonic() >= self.deadline:
                 raise TimeoutError("Program deadline exhausted before next step")
             self.write_started |= write
-            value = await operation()
+            value = await self._invoke(operation)
             row["status"] = "returned"
             if write:
                 row["receipt"] = {"status": value.status, "detail": value.detail}
@@ -132,7 +161,9 @@ async def execute(
         raise ValueError("Program deadline must be in (0, 120] seconds")
     artifact = Artifact.read(artifact_path)
     parameters = artifact.parameters(parameters)
-    run = ProgramContext(artifact, parameters, timeout_s, emit, checkpoint, observe_environment)
+    run = ProgramContext(
+        artifact, parameters, timeout_s, emit, checkpoint, observe_environment, getattr(computer, "_executor", None)
+    )
     status, failure = "awaiting_acceptance", None
     module_name = "_computer_use_program_" + run.id.replace("-", "")
     try:
@@ -144,7 +175,10 @@ async def execute(
             run.event("program_selection", selection=asdict(selection))
             if not selection.allowed:
                 raise _Refused("Program admission denied: " + selection.reason)
-        async with asyncio.timeout_at(run.deadline):
+        remaining = run.deadline - monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Program deadline exhausted before entry")
+        async with asyncio.timeout(remaining):
             module = types.ModuleType(module_name)
             module.__file__ = str(artifact.path / "program.py")
             sys.modules[module_name] = module

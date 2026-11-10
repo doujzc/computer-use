@@ -8,6 +8,8 @@ import weakref
 
 from computer_use.identity import WeakIdentityMap
 from computer_use.protocol.captures import capture_metadata
+from computer_use.protocol.png import png_size
+from computer_use.session.image_coordinates import ImageCoordinates
 
 _sources = WeakIdentityMap()
 _byte_sources = {}
@@ -88,7 +90,28 @@ def image_metadata(png):
     return known["metadata"] if known is not None else None
 
 
-def image_delivered(png):
+def register_image_delivery(png, callback):
+    """Attach accounting to the existing exact-image delivery acknowledgement."""
+    known = _source(png)
+    if known is not None:
+        known.setdefault("delivery_callbacks", []).append(callback)
+
+
+def image_delivered(png, coordinates: ImageCoordinates | None = None):
     known = _source(png)
     if known is not None and known["source"].get("current", lambda: True)() is not False:
-        known["source"].get("delivered", lambda: None)()
+        delivered = known["source"].get("delivered")
+        if delivered is not None:
+            if coordinates is not None:
+                size = png_size(png)
+                if coordinates.source_size != (size["width"], size["height"]):
+                    raise ValueError("The delivered coordinate map does not belong to this source PNG.")
+            if coordinates is None or coordinates.source_size == coordinates.delivered_size:
+                delivered()
+            else:
+                delivered(coordinates)
+    # Display accounting is independent of current input authority: an exact
+    # historical image can be shown without renewing its native coordinate map.
+    if known is not None:
+        for callback in known.pop("delivery_callbacks", ()):
+            callback()

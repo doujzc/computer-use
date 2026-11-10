@@ -7,6 +7,8 @@ No launch, focus, screenshot, or legacy readApp bootstrap occurs here. A native-
 only window remains a valid visual target even when it has no AX root.
 """
 
+from enum import Enum
+
 from computer_use.errors import ComputerUseError
 from computer_use.native.contracts import Binding
 
@@ -18,7 +20,6 @@ def _refuse(code, detail, target="working window"):
             effect="none",
             target=target,
             detail=detail,
-            next="inspect the directory and explicitly select an observed " + target,
         )
     )
 
@@ -41,7 +42,7 @@ def _running_match(directory, installation):
     if directory["stopReasons"]:
         _refuse(
             "observation_incomplete",
-            "Application discovery is partial; select an exact running application id.",
+            "Application discovery is partial; running application identity is unresolved.",
             "application",
         )
     observed_keys = keys.intersection(key for item in running for key in item.get("matchKeys", []))
@@ -53,8 +54,7 @@ def _running_match(directory, installation):
     if len(running) != 1 or len(recipes) != 1:
         _refuse(
             "ambiguous_target",
-            "Declared window identity does not identify one running application and installation; "
-            "select an exact observed running application id.",
+            "Declared window identity has ambiguous running application and installation matches.",
             "application",
         )
     return dict(running[0])
@@ -73,9 +73,13 @@ def select_application(directory, selector):
         return dict(windows[0])
     # Exact native identifiers/paths outrank names. Declared alternate names
     # only broaden discovery; they never bind or merge application lifetimes.
-    matches = [item for item in entries if selector in (item["identifier"], item["path"])]
-    if not matches:
-        name = selector.strip().casefold()
+    name = selector.strip().casefold()
+    matches = (
+        list(entries)
+        if directory.get("path") == selector
+        else [item for item in entries if selector in (item["identifier"], item["path"])]
+    )
+    if not matches and not selector.startswith("/"):
         matches = []
         for item in entries:
             if any(value.casefold() == name for value in [item["displayName"], *item.get("aliases", [])]):
@@ -83,27 +87,49 @@ def select_application(directory, selector):
     active = [item for item in matches if item["isRunning"]]
     matches = active or matches
     if directory["stopReasons"]:
-        _refuse(
-            "observation_incomplete",
-            "Application discovery is partial; use an exact observed application id.",
-            "application",
+        exact_windows_process = (
+            directory.get("platform") == "windows"
+            and directory.get("scope") == "runningWindows"
+            and len(matches) == 1
+            and matches[0]["isRunning"]
+            and [
+                row["application"] for row in directory.get("nativeProcessNames", ()) if row["name"].casefold() == name
+            ] == [matches[0]["id"]]
         )
+        if not exact_windows_process:
+            _refuse(
+                "observation_incomplete",
+                "Application discovery is partial; application identity is unresolved.",
+                "application",
+            )
     if len(matches) != 1:
         if not matches and directory.get("scope") == "runningWindows":
             _refuse(
                 "element_not_found",
                 "No observed running window matches "
                 + selector
-                + ". This driver does not discover or launch installed applications; "
-                "read the desktop or list_apps() and select a running application/window.",
+                + ". Discovery scope: running windows. Installed-application discovery and launch: unavailable.",
                 "application",
             )
-        _refuse(
-            "ambiguous_target" if matches else "element_not_found",
-            "Application selector has no unique match: " + selector,
-            "application",
-        )
+        detail = "Application selector has no unique match: " + selector
+        if matches and directory.get("platform") == "macos":
+            detail += (
+                ". Use computer.list_windows(app_name=...) with the exact display name, "
+                "then read the intended app_id and window_ref."
+            )
+        _refuse("ambiguous_target" if matches else "element_not_found", detail, "application")
     return _running_match(directory, matches[0])
+
+
+def applications_query(selector=None, *, installation=None, capabilities=()):
+    """Resolve exact paths or retained installations on the driver host."""
+    query = dict(kind="applications")
+    if "nativeApplicationPath" in capabilities:
+        if installation is not None:
+            query["installation"] = installation
+        elif selector is not None and selector.startswith("/"):
+            query["path"] = selector
+    return query
 
 
 def selected_window(application, selector):
@@ -124,7 +150,8 @@ def select_surface(directory, window=None, *, follow_modal=True):
     else:
         if any(item["parentState"] == "unknown" for item in entries.values()):
             _refuse(
-                "observation_incomplete", "Some windows have unknown ownership; select an explicit observed window."
+                "observation_incomplete",
+                "Some windows have unknown ownership; implicit window selection is unresolved.",
             )
         for key in entries:
             seen, current = set(), key
@@ -132,18 +159,18 @@ def select_surface(directory, window=None, *, follow_modal=True):
                 if current not in entries or current in seen:
                     _refuse(
                         "observation_incomplete",
-                        "Window ownership is incomplete or cyclic; select an explicit observed window.",
+                        "Window ownership is incomplete or cyclic; implicit window selection is unresolved.",
                     )
                 seen.add(current)
                 current = entries[current]["parent"]
         candidates = [key for key, item in entries.items() if item["parent"] not in entries and item["kind"] != "menu"]
         if len(candidates) != 1:
             code = "ambiguous_target" if len(candidates) > 1 else "observation_incomplete"
-            _refuse(code, "Select one working window using a reference from Windows; the directory has no unique root.")
+            _refuse(code, "The window directory has no unique root.")
         if directory["stopReasons"]:
             _refuse(
                 "observation_incomplete",
-                "An incomplete directory cannot prove that the only observed root is the only window.",
+                "Window directory is incomplete; root uniqueness is unknown.",
             )
         root = candidates[0]
     view, visited = root, {root}
@@ -151,7 +178,7 @@ def select_surface(directory, window=None, *, follow_modal=True):
         while True:
             children = [key for key, item in entries.items() if item["parent"] == view and item["modal"] is True]
             if len(children) > 1:
-                _refuse("ambiguous_target", "Several confirmed modal children require an explicit view selection.")
+                _refuse("ambiguous_target", "Several confirmed modal children match the requested view.")
             if not children:
                 break
             view = children[0]
@@ -162,9 +189,24 @@ def select_surface(directory, window=None, *, follow_modal=True):
     return Binding(directory["session"], entries[root]["instance"], root, selected["surface"], selected["node"])
 
 
-def surfaces_query(application, *, accessibility=True, capabilities=()):
+class SurfaceReadProfile(Enum):
+    """The immutable directory intent, independent of native worker isolation."""
+
+    ACCESSIBILITY = "accessibility"
+    VISUAL = "visual"
+
+
+def surfaces_query(application, *, profile=SurfaceReadProfile.ACCESSIBILITY, capabilities=(), root_window=None):
     """Optional read-isolation flags require the driver's declared contract."""
+    if not isinstance(profile, SurfaceReadProfile):
+        raise ValueError("A typed surface read profile is required")
     query = dict(kind="surfaces", application=application)
-    if not accessibility and "nativeReadIsolation" in capabilities:
-        query["includeAccessibility"] = False
+    if root_window is not None:
+        query["rootWindow"] = root_window
+    if profile is SurfaceReadProfile.VISUAL:
+        if "nativeVisualSurfaceQuery" in capabilities:
+            query["profile"] = "visual"
+        elif "nativeReadIsolation" in capabilities:
+            # Existing Windows wire/worker contract remains unchanged.
+            query["includeAccessibility"] = False
     return query

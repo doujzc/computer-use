@@ -50,6 +50,7 @@ class AppObservation:
         launch: Original startup receipt; retained even when later observation fails.
         menus: Menu snapshots collected for the same application scope.
         overview: Related-window preview and its source metadata, when collected.
+        snapshots_numbered: Whether tree and menu references are public display aliases.
     """
 
     selection: WorkingWindow
@@ -68,6 +69,7 @@ class AppObservation:
     menus: MenuRead | None = None
     overview: WindowOverview | None = None
     context_notes: tuple[DisplayText, ...] = ()
+    snapshots_numbered: bool = True
 
     @cached_property
     def text(self) -> str:
@@ -118,7 +120,9 @@ class WindowSelectionRequired(ComputerUseError):
         overview: WindowOverview | None = None,
         selection: WorkingWindow | None = None,
     ) -> None:
-        super().__init__({key: getattr(error, key) for key in ("code", "effect", "target", "detail", "next")})
+        super().__init__(
+            {key: getattr(error, key) for key in ("code", "effect", "target", "detail", "impact")}, cause=error
+        )
         self.application, self.display_name, self.directory, self.launch = application, name, directory, launch
         self.overview = overview
         self.selection = selection

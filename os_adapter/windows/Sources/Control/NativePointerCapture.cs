@@ -18,6 +18,8 @@ namespace ComputerUse.Windows
 
     // Retain metadata, never PNG bytes or an inferred UIA target. Scope and
     // transforms cannot be refreshed implicitly after the model sees an image.
+    // A selected execution may freeze a separate full-window translation;
+    // that never mutates these pixels, scale, inset or capture-time bounds.
     internal sealed class NativePointerCapture
     {
         internal readonly Dictionary<string, object> Binding;
@@ -34,6 +36,27 @@ namespace ComputerUse.Windows
             this.displays = (NativeCaptureGeometry[])displays.Clone();
         }
 
+        internal Dictionary<string, object> Checkpoint()
+        {
+            return Wire.Obj("binding", Binding, "image", Image.Checkpoint(), "canvas", Canvas.Checkpoint(),
+                            "layout", Layout, "displays", displays.Select(display => display.Checkpoint()).ToArray(),
+                            "windowBounds", WindowBounds.Checkpoint());
+        }
+
+        internal static NativePointerCapture Restore(object raw, string session)
+        {
+            var value = Wire.Object(raw);
+            Wire.Keys(value, "binding,image,canvas,layout,displays,windowBounds");
+            var binding = NativeBinding.Resolve(value["binding"], session);
+            var displays = Wire.Array(value["displays"]);
+            if (binding["capture"] == null || displays.Length < 1 || displays.Length > 32)
+                throw new Failure("invalid_request", "invalid captured pointer checkpoint");
+            return new NativePointerCapture(binding, NativeCaptureGeometry.Restore(value["image"]),
+                                            NativeCaptureGeometry.Restore(value["canvas"]), Wire.Str(value, "layout"),
+                                            displays.Select(NativeCaptureGeometry.Restore).ToArray(),
+                                            NativeCaptureGeometry.Restore(value["windowBounds"]));
+        }
+
         internal static bool Contains(NativeCaptureGeometry box, NativePointerPoint p)
         {
             return p.X >= box.X && p.Y >= box.Y && (long)p.X < (long)box.X + box.NativeWidth && (long)p.Y < (long)box.Y + box.NativeHeight;
@@ -45,12 +68,27 @@ namespace ComputerUse.Windows
                 throw new Failure("invalid_request", "pointer trajectory leaves the captured displays");
         }
 
+        internal void RequireCapturedPoint(NativePointerPoint point)
+        {
+            if (!Contains(Image, point))
+                throw new Failure("invalid_request", "pointer trajectory leaves the retained image");
+            // A window image may include pixels captured outside the desktop.
+            // Their current projected coordinates determine screen reachability.
+            if (Binding["surface"] == null)
+                RequirePoint(point);
+        }
+
         internal NativePointerPoint Point(double x, double y)
         {
             if (Double.IsNaN(x) || Double.IsNaN(y) || x < 0 || y < 0 || x >= Image.Width || y >= Image.Height)
                 throw new Failure("invalid_request", "coordinates are outside the retained image");
-            var p = new NativePointerPoint(Image.X + (int)Math.Floor(x * Image.NativeWidth / Image.Width), Image.Y + (int)Math.Floor(y * Image.NativeHeight / Image.Height));
-            RequirePoint(p);
+            long physicalX = (long)Image.X + (int)Math.Floor(x * Image.NativeWidth / Image.Width);
+            long physicalY = (long)Image.Y + (int)Math.Floor(y * Image.NativeHeight / Image.Height);
+            if (physicalX < Int32.MinValue || physicalX > Int32.MaxValue ||
+                physicalY < Int32.MinValue || physicalY > Int32.MaxValue)
+                throw new Failure("invalid_request", "image coordinates exceed physical screen integer coordinates");
+            var p = new NativePointerPoint((int)physicalX, (int)physicalY);
+            RequireCapturedPoint(p);
             return p;
         }
 
@@ -82,14 +120,47 @@ namespace ComputerUse.Windows
 
         internal void Add(string id, Dictionary<string, object> binding, NativeCaptureGeometry image, NativeCaptureGeometry canvas, string layout, NativeCaptureGeometry[] displays, NativeCaptureGeometry windowBounds = null)
         {
-            if (binding["capture"] != null || binding["node"] != null || captures.ContainsKey(id))
+            if (binding["capture"] != null || binding["node"] != null)
                 throw new Failure("invalid_request", "capture retention requires a new window or desktop read binding");
             var target = new Dictionary<string, object>(binding);
             target["capture"] = id;
-            captures.Add(id, new NativePointerCapture(target, image, canvas, layout, displays, windowBounds));
+            Retain(new NativePointerCapture(target, image, canvas, layout, displays, windowBounds));
+        }
+
+        internal void Retain(NativePointerCapture capture)
+        {
+            string id = (string)capture.Binding["capture"];
+            if (captures.ContainsKey(id))
+                throw new Failure("invalid_request", "capture token is already retained");
+            captures.Add(id, capture);
             order.Enqueue(id);
             while (order.Count > capacity)
                 captures.Remove(order.Dequeue());
+        }
+
+        internal object Checkpoint(string id)
+        {
+            NativePointerCapture capture;
+            return captures.TryGetValue(id, out capture) ? capture.Checkpoint() : null;
+        }
+
+        internal object[] Checkpoints(Func<NativePointerCapture, bool> retain)
+        {
+            var result = new List<object>();
+            int count = order.Count;
+            for (int index = 0; index < count; index++)
+            {
+                string id = order.Dequeue();
+                var capture = captures[id];
+                if (retain(capture))
+                {
+                    order.Enqueue(id);
+                    result.Add(capture.Checkpoint());
+                }
+                else
+                    captures.Remove(id);
+            }
+            return result.ToArray();
         }
 
         internal NativePointerCapture Get(Dictionary<string, object> target)

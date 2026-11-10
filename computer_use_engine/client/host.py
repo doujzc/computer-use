@@ -4,6 +4,7 @@
 from computer_use.diagnostics import record_structured_observations, set_diagnostic_handler
 from computer_use.native.preview import set_preview_handler
 from computer_use.session.events import set_action_handler, set_observation_handler
+from computer_use.session.lookup_continuation import lookup_continuation_scope
 from computer_use.session.operations import set_execution_guard
 from computer_use.session.results import set_text_page_handler
 
@@ -11,6 +12,9 @@ from .handles import set_handle_handler
 
 __all__ = [
     "computer_host",
+    "disable_global_input_for_process",
+    "global_input_allowed",
+    "lookup_continuation_scope",
     "record_structured_observations",
     "set_action_handler",
     "set_diagnostic_handler",
@@ -20,6 +24,18 @@ __all__ = [
     "set_preview_handler",
     "set_text_page_handler",
 ]
+
+_global_input_allowed = True
+
+
+def disable_global_input_for_process():
+    """Apply the host's input ceiling before the worker constructs its sessions."""
+    global _global_input_allowed
+    _global_input_allowed = False
+
+
+def global_input_allowed():
+    return _global_input_allowed
 
 
 def computer_host(factory=None):
@@ -32,13 +48,4 @@ def computer_host(factory=None):
         factory = Computer
     computer = factory()
 
-    async def close():
-        # The pipeline shares retained bindings with their owning service.
-        # pylint: disable-next=protected-access
-        transport = computer._controller.transport
-        if hasattr(transport, "close"):
-            transport.close()
-        if hasattr(transport, "wait_closed"):
-            await transport.wait_closed()
-
-    return Record(computer=computer, close=close)
+    return Record(computer=computer, close=computer.close)

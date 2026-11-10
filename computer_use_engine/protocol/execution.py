@@ -6,13 +6,12 @@
 import json
 import math
 
-from computer_use.protocol.primitives import required_item
-
 from .action_context import decode_action_context
 from .captures import capture_metadata, decode_capture, decode_stamp
 from .desktop import decode_desktop_observation
-from .directory import _application, decode_directory
+from .directory import _application, app_change, decode_directory
 from .observation.adapters import validate_driver_payload
+from .primitives import required_item
 from .schema import array, boolean, enum, identity, number, obj, string, union, unknown
 from .text import decode_text_page
 
@@ -49,7 +48,26 @@ binding = obj(
     )
 )
 application_binding = obj(dict(session=identity, application=identity))
-operation_target = union(binding, application_binding)
+global_target = obj({"session": identity, "global": boolean()})
+operation_target = union(binding, application_binding, global_target)
+screen_point = obj({"x": number(), "y": number()})
+
+
+def decode_point_location_request(value):
+    """Location is a read-only conversion, not input or target preparation."""
+    return obj({"target": binding, "point": screen_point.nullable()}).parse(value)
+
+
+def decode_observation_preparation_request(value):
+    result = obj(dict(operation=identity, target=binding)).parse(value)
+    target = result["target"]
+    if any(target[key] is None for key in ("instance", "rootWindow", "surface")) or any(
+        target[key] is not None for key in ("node", "capture")
+    ):
+        raise ValueError("Observation preparation requires an exact window scope")
+    return result
+
+
 current_receiver = obj(
     dict(
         state=enum("confirmed", "absent", "unavailable", "conflict"),
@@ -85,7 +103,7 @@ click_offer = obj(
         admission=enum("ready", "preparationRequired", "unavailable", "insufficientEvidence"),
         reason=string().nullable(),
         preparationOptions=array(enum("background", "foreground"), max=2),
-        preferenceProfile=enum("default", "physicalWhenAvailableInExclusive"),
+        preferenceProfile=enum("default", "physicalRequired"),
     )
 )
 click_dispatch = enum("notDispatched", "dispatched", "partial", "unknown")
@@ -149,12 +167,40 @@ primitive = obj(
         readiness=knowledge,
         pending=array(enum(*pending_conditions), max=5),
         backgroundPreparation=knowledge,
+        globalInput=knowledge.optional(),
+        keyboardEditing=enum("insert", "replace").optional(),
+        preparationImpact=obj(
+            dict(mouse=knowledge, keyboard=knowledge, activation=knowledge, clipboard=knowledge)
+        ).optional(),
         action=obj(dict(name=identity, description=string().optional())).optional(),
         click=click_offer.optional(),
     )
 )
 
 cleanup = enum("complete", "failed", "unknown")
+input_impact = obj(
+    dict(
+        coverage=enum("complete", "partial"),
+        effects=array(
+            obj(dict(
+                stage=enum("preparation", "input", "cleanup"),
+                device=enum("mouse", "keyboard", "focus", "element", "clipboard", "application"),
+                transport=enum(
+                    "globalHID", "process", "accessibility", "activation", "windowServer", "clipboard", "launch"
+                ),
+                mechanism=string(min=1, max=512),
+                state=enum("invoked", "possible", "notInvoked"),
+            )),
+            max=128,
+        ),
+        foregroundChanged=knowledge,
+        clipboardRestoration=enum("notUsed", "restored", "ownershipLost", "failed", "unknown"),
+        foregroundRestoration=enum(
+            "notUsed", "notNeeded", "restored", "ownershipLost", "retained", "unavailable", "failed", "unknown"
+        ).optional(),
+        omittedEffects=number(integer=True, min=0).optional(),
+    )
+)
 # These are wire-contract meanings, not a fallback policy. Both decoded driver
 # declarations and in-process NativePort implementations obey the same rules.
 unit_contracts = {
@@ -173,12 +219,19 @@ unit_contracts = {
     "launch_application": ({"object"}, {"launch"}),
 }
 
-_intent = obj(dict(kind=enum("read", *intent_kinds), parameters=unknown()))
+_intent = obj(dict(kind=enum("read", *intent_kinds), parameters=unknown(), globalInput=boolean().optional()))
 _begin = obj(
-    dict(mode=enum("read", "write"), target=operation_target, intent=_intent, clickContract=enum("v1", "v2").optional())
+    dict(
+        mode=enum("read", "write"),
+        target=operation_target,
+        intent=_intent,
+        clickContract=enum("v1", "v2").optional(),
+    )
 )
 _unit_command = obj(
-    dict(kind=enum(*unit_contracts), primitiveId=identity, target=operation_target, foreground=boolean())
+    dict(
+        kind=enum(*unit_contracts, "global_input"), primitiveId=identity, target=operation_target, foreground=boolean()
+    )
 )
 _capture_request = obj(
     dict(
@@ -186,6 +239,7 @@ _capture_request = obj(
         target=binding,
         kind=enum("window", "desktop"),
         maxDimension=number(integer=True, min=1, max=4096),
+        retainedCaptures=array(identity).optional(),
     )
 )
 
@@ -205,6 +259,18 @@ def decode_begin(value):
     """Bind the original payload once, before observing or preparing a route."""
     result = _begin.parse(value)
     intent, mode = result["intent"], result["mode"]
+    if "global" in result["target"]:
+        explicit_global_write = (
+            result["target"]["global"] is True and mode == "write" and intent.get("globalInput") is True
+        )
+        if (
+            not explicit_global_write
+            or intent["kind"] not in ("click", "scroll", "drag", "insert", "paste", "key")
+            or "clickContract" in result
+        ):
+            raise ValueError("protocol: global scope requires an explicit primitive input")
+    if intent.get("globalInput") and result["target"].get("global") is not True:
+        raise ValueError("protocol: explicit global input requires the global session scope")
     if "clickContract" in result and (mode != "write" or intent["kind"] != "click"):
         raise ValueError("protocol: click contract requires a write click operation")
     if not isinstance(intent["parameters"], dict):
@@ -229,6 +295,11 @@ def decode_unit_command(value):
     Parameters are validated by the chosen native unit before preparation.
     """
     result = _unit_command.parse(value)
+    if "global" in result["target"] or result["kind"] == "global_input":
+        direct_global_input = result["target"].get("global") is True and result["kind"] == "global_input"
+        if not direct_global_input or result["primitiveId"] != "global" or result["foreground"]:
+            raise ValueError("protocol: global input has no object selection or foreground preparation")
+        return result
     installation = "application" in result["target"]
     if installation != (result["kind"] == "launch_application"):
         raise ValueError("protocol: an installation target permits only application launch")
@@ -273,9 +344,35 @@ def decode_selection_basis(value):
 
 _inspect_queries = {
     "launch": obj(dict(kind=enum("launch"))),
-    "applications": obj(dict(kind=enum("applications"))),
-    "surfaces": obj(dict(kind=enum("surfaces"), application=identity, includeAccessibility=boolean().optional())),
-    "roots": obj(dict(kind=enum("roots"), application=identity)),
+    "applications": obj(
+        {
+            "kind": enum("applications"), "path": identity.optional(), "installation": identity.optional(),
+            "includeEnded": boolean().optional(), "windowTitle": identity.optional(),
+        }
+    ),
+    "windowCatalogue": obj(dict(kind=enum("windowCatalogue"), appName=identity)),
+    "surfaceBatch": obj(
+        dict(kind=enum("surfaceBatch"), applications=array(identity, min=1, max=64), profile=enum("visual").optional())
+    ),
+    "surfaces": obj(
+        dict(
+            kind=enum("surfaces"),
+            application=identity,
+            includeAccessibility=boolean().optional(),
+            profile=enum("visual").optional(),
+            rootWindow=identity.optional(),
+        )
+    ),
+    "roots": obj(dict(kind=enum("roots"), application=identity, applicationContent=boolean().optional())),
+    "appChanges": obj({"kind": enum("appChanges"), "application": identity}),
+    "waitAppChange": obj(
+        {
+            "kind": enum("waitAppChange"),
+            "application": identity,
+            "after": identity,
+            "timeoutMs": number(integer=True, min=1, max=400),
+        }
+    ),
     "inputContext": obj(
         dict(
             kind=enum("inputContext"),
@@ -291,9 +388,14 @@ _inspect_queries = {
             kind=enum("nodes"),
             fields=array(identity, min=1, max=128),
             advertisedFields=array(identity, min=1, max=128).optional(),
+            textContent=boolean().optional(),
+            focusedElement=boolean().optional(),
+            shareAttributeCatalogues=enum(True).optional(),
+            actionDetail=enum("none", "names", "full").optional(),
             followRelations=array(identity, min=1, max=16).optional(),
             focusedFields=array(enum("Text.CaretRange"), min=1, max=1).optional(),
             primaryFields=array(enum("Text.LineRanges"), min=1, max=1).optional(),
+            strictWindow=boolean().optional(),
             maxNodes=number(integer=True, min=1, max=2000),
             maxDepth=number(integer=True, min=0, max=2000),
             childrenPage=obj(dict(cursor=nullable_id, limit=number(integer=True, min=1, max=1999))).optional(),
@@ -321,6 +423,17 @@ def decode_inspect_query(value):
     if not isinstance(value, dict) or not isinstance(value.get("kind"), str) or value["kind"] not in _inspect_queries:
         raise ValueError("protocol: unknown native inspection query")
     result = _inspect_queries[value["kind"]].parse(value)
+    exact_application_path = result["kind"] == "applications" and "path" in result
+    if exact_application_path and ("installation" in result or not result["path"].startswith("/")):
+        raise ValueError("protocol: invalid exact application query")
+    if "includeEnded" in result:
+        include_ended = result["includeEnded"] is True
+        if not include_ended or "path" in result or "installation" in result:
+            raise ValueError("protocol: ended lifetimes require a full application query")
+    if "windowTitle" in result and any(key in result for key in ("path", "installation", "includeEnded")):
+        raise ValueError("protocol: window caption and application scope queries cannot be combined")
+    if "profile" in result and "includeAccessibility" in result:
+        raise ValueError("protocol: surface profile and legacy accessibility flag cannot be combined")
     if "currentReceiver" in result and (
         result["currentReceiver"] is not True or any(key in result for key in ("actuator", "receiver", "basis"))
     ):
@@ -335,7 +448,7 @@ def decode_inspect_query(value):
     if "primaryFields" in result and not set(result["primaryFields"]) <= set(result["fields"]):
         raise ValueError("protocol: primary fields must belong to the requested fields")
     if "childrenPage" in result and "relationPage" in result:
-        raise ValueError("protocol: select one root relation page")
+        raise ValueError("protocol: exactly one root relation page is required")
     page = result.get("relationPage", result.get("childrenPage"))
     if page is not None and (result["maxDepth"] < 1 or page["limit"] >= result["maxNodes"]):
         raise ValueError("protocol: a relation page needs depth and space for its root and targets")
@@ -361,7 +474,7 @@ def decode_inspect_query(value):
         and selected["node"] in (selected["region"], selected["bar"])
     ):
         raise ValueError("protocol: a page button must be distinct from its region and bar")
-    for key in ("within", "fields", "followRelations"):
+    for key in ("within", "fields", "followRelations", "applications"):
         if key in result and len(set(result[key])) != len(result[key]):
             raise ValueError("protocol: duplicate native query " + key)
     return result
@@ -388,6 +501,10 @@ def validate_primitive_contract(unit, channel, supported, readiness, pending, ac
 
 def _validate_primitive(p):
     validate_primitive_contract(p["unit"], p["channel"], p["supported"], p["readiness"], p["pending"], p.get("action"))
+    if "keyboardEditing" in p:
+        keyboard_primitive = p["unit"] == "key_sequence" and p["channel"] == "keyboard"
+        if not keyboard_primitive or p.get("globalInput") != "no":
+            raise ValueError("protocol: keyboard editing evidence requires an addressed keyboard primitive")
     if p["unit"] == "native_selection" and "click" not in p:
         raise ValueError("protocol: native selection requires an integrated click offer")
     if "click" in p:
@@ -422,7 +539,7 @@ def validate_click_receipt(value, target, dispatch, cleanup_result):
     if dispatch in ("dispatched", "partial") and not transport["callEntered"]:
         raise ValueError("protocol: submitted click requires transport entry evidence")
     if dispatch == "notDispatched" and transport["callEntered"] and not transport["callReturned"]:
-        raise ValueError("protocol: an unresolved input call cannot prove zero dispatch")
+        raise ValueError("protocol: zero dispatch conflicts with an unresolved input call")
     if (
         dispatch == "notDispatched"
         and transport["callEntered"]
@@ -458,12 +575,14 @@ def validate_click_receipt(value, target, dispatch, cleanup_result):
 
 
 _schemas = {
+    "locatePoint": obj({"point": screen_point}),
     "begin": obj(
         dict(
             operation=identity,
             target=operation_target,
             remainingMs=number(integer=True, min=0, max=120000),
             clickContract=enum("v1", "v2").optional(),
+            appChangeBaseline=app_change.nullable().optional(),
         )
     ),
     "inspect": obj(
@@ -501,15 +620,28 @@ _schemas = {
             context=unknown(),
             application=_application.optional(),
             click=click_receipt.optional(),
+            impact=input_impact.optional(),
+            appChangeInputBaseline=app_change.nullable().optional(),
         )
     ),
     "finish": obj(dict(cleanup=cleanup)),
+    "prepareObservation": obj(
+        dict(
+            kind=enum("observationPreparation"),
+            binding=binding,
+            activation=enum("notRequested", "requested"),
+            raiseStatus=enum("notRequested", "requested", "unsupported", "unknown"),
+            foreground=boolean(),
+            redraw=enum("unknown"),
+        )
+    ),
     "capture": obj(
         dict(
             kind=enum("capture"),
             binding=binding,
             observed=unknown(),
             image=unknown(),
+            windowScopeChanged=boolean().optional(),
             coordinates=obj(
                 dict(
                     space=enum("window-pixels"),
@@ -532,6 +664,29 @@ _launch_facts = obj(
     )
 )
 _captured_text = obj(dict(kind=enum("capturedText"), session=identity, textRef=identity, page=unknown()))
+_app_changes = obj(
+    {
+        "kind": enum("appChanges"),
+        "session": identity,
+        "application": identity,
+        "incarnation": nullable_id,
+        "token": nullable_id,
+        "available": boolean(),
+        "notifications": array(identity, max=32),
+    }
+)
+_wait_app_change = obj(
+    {
+        "kind": enum("waitAppChange"),
+        "session": identity,
+        "application": identity,
+        "incarnation": nullable_id,
+        "token": nullable_id,
+        "reason": enum("event", "timeout", "unavailable"),
+        "events": array(identity, max=32),
+        "elapsedMs": number(min=0).optional(),
+    }
+)
 _read_change = obj(
     dict(
         kind=enum("readChange"),
@@ -556,7 +711,21 @@ _desktop_capture = obj(
 )
 
 
-def decode_execution_result(method, value):
+def decode_execution_result(method, value, *, retain_observation=False):
+    if method == "inspect" and isinstance(value, dict) and value.get("kind") == "appChanges":
+        result = _app_changes.parse(value)
+        if result["available"] and any(result[key] is None for key in ("incarnation", "token")):
+            raise ValueError("protocol: available application changes require an observer incarnation and token")
+        return result
+    if method == "inspect" and isinstance(value, dict) and value.get("kind") == "waitAppChange":
+        result = _wait_app_change.parse(value)
+        if len(set(result["events"])) != len(result["events"]) or (result["reason"] == "event") != bool(
+            result["events"]
+        ):
+            raise ValueError("protocol: application event hints contradict their wake reason")
+        if result["reason"] == "event" and any(result[key] is None for key in ("incarnation", "token")):
+            raise ValueError("protocol: application events require an observer incarnation and token")
+        return result
     if method == "inspect" and isinstance(value, dict) and value.get("kind") == "readChange":
         result = _read_change.parse(value)
         if len(set(result["events"])) != len(result["events"]) or (result["reason"] == "event") != bool(
@@ -585,18 +754,29 @@ def decode_execution_result(method, value):
         if p["unit"] != "launch_application":
             raise ValueError("protocol: inconsistent application launch contract")
         return result
-    if method == "inspect" and isinstance(value, dict) and value.get("kind") in ("applications", "surfaces", "roots"):
+    if (
+        method == "inspect"
+        and isinstance(value, dict)
+        and value.get("kind") in ("applications", "surfaces", "roots", "surfaceBatch", "windowCatalogue")
+    ):
         return decode_directory(value)
     if method == "inspect" and isinstance(value, dict) and value.get("kind") == "observation":
+        if retain_observation:
+            from .observation.adapters.wire import DecodedDriverObservation
+
+            return DecodedDriverObservation(value)
         validate_driver_payload(value)
         return value
     result = _schemas[method].parse(value)
     bound = result.get("target") or result.get("binding")
+    if bound is not None and "global" in bound and bound["global"] is not True:
+        raise ValueError("protocol: invalid global input scope")
     invalid_bound = (
         True
         if (
             bound is not None
             and "application" not in bound
+            and "global" not in bound
             and bound["surface"] is None
             and any(bound[key] is not None for key in ("instance", "rootWindow", "node"))
         )
@@ -604,6 +784,13 @@ def decode_execution_result(method, value):
     )
     if invalid_bound:
         raise ValueError("protocol: unbound discovery cannot contain window or element identities")
+    baseline = result.get("appChangeBaseline") if method == "begin" else result.get("appChangeInputBaseline")
+    if baseline is not None:
+        session_changed = baseline["session"] != bound["session"]
+        if session_changed or (
+            "application" in bound and baseline["application"] != bound["application"]
+        ):
+            raise ValueError("protocol: application change baseline changed the operation scope")
     if method == "execute" and "application" in result:
         if "application" not in bound or not result["application"]["isRunning"]:
             raise ValueError("protocol: only an installation operation can return a running application")
@@ -691,6 +878,9 @@ def decode_execution_result(method, value):
         for p in result["primitives"]:
             _validate_primitive(p)
     if method == "execute":
+        impact = result.get("impact")
+        if impact is not None and impact["coverage"] == "complete" and impact.get("omittedEffects", 0):
+            raise ValueError("protocol: complete input impact cannot omit effects")
         if "click" in result:
             validate_click_receipt(result["click"], result["target"], result["dispatch"], result["cleanup"])
         if result["context"] is not None:

@@ -3,43 +3,61 @@
 
 """Serialize diagnostic evidence and persist the server-owned execution journal.
 
-IPC and JSONL logs share dumps(). Importing this module performs no file I/O;
-only constructing Journal creates a private log. This module does not own UI
-presentation, history cursors, worker transport, or execution state.
+IPC and JSONL logs share dumps(). Pipeline traces flush together within one
+loop turn; externally visible events and metadata flush all preceding traces.
 """
 
 import json
 import os
+import re
 import sys
 import uuid
+from asyncio import get_running_loop
 from datetime import datetime, timezone
 from pathlib import Path
 
 from computer_use.diagnostics import SDK_VERSION
 from computer_use.json import dumps as legacyDumps
 
+_SURROGATES = re.compile(r"[\ud800-\udfff]")
 
-def _is_native_observation(event):
-    if not isinstance(event, dict):
-        return False
-    result = event.get("result")
-    if not isinstance(result, dict):
-        return False
-    return (
-        event.get("kind") == "command_end" and event.get("method") == "inspect" and result.get("kind") == "observation"
+
+def _trace_field(value):
+    if value is None or type(value) in (bool, int):
+        return True
+    if isinstance(value, str):
+        return value.isascii() or _SURROGATES.search(value) is None
+    return isinstance(value, (list, tuple)) and all(
+        isinstance(part, str) and (part.isascii() or _SURROGATES.search(part) is None) for part in value
     )
 
 
 def dumps(value):
-    """Encode validated native evidence directly, retaining the general-record fallback."""
     event = value.get("diagnostic", value) if isinstance(value, dict) else None
-    if _is_native_observation(event):
-        try:
-            return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-        except (TypeError, ValueError):
-            # Keep the diagnostic callback tolerant of non-native/custom
-            # records rather than losing evidence to an optimization.
-            pass
+    if isinstance(event, dict) and event.get("kind") == "pipeline":
+        pipeline_fields = all(
+            isinstance(key, str) and not key.isdecimal() and _trace_field(item) for key, item in event.items()
+        )
+        if pipeline_fields and (
+            event is value
+            or all(
+                isinstance(key, str) and not key.isdecimal() and (key == "diagnostic" or _trace_field(item))
+                for key, item in value.items()
+            )
+        ):
+            try:
+                return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+            except (TypeError, ValueError):
+                pass
+    if isinstance(event, dict) and event.get("kind") == "command_end" and event.get("method") == "inspect":
+        result = event.get("result")
+        if isinstance(result, dict) and result.get("kind") == "observation":
+            try:
+                return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+            except (TypeError, ValueError):
+                # Keep the diagnostic callback tolerant of non-native/custom
+                # records rather than losing evidence to an optimization.
+                pass
     return legacyDumps(value)
 
 
@@ -48,7 +66,7 @@ def now():
 
 
 class Journal:
-    def __init__(self, directory=None):
+    def __init__(self, directory=None, *, allow_global_input=True):
         directory = Path(
             directory
             if directory is not None
@@ -56,6 +74,7 @@ class Journal:
         )
         self.path = directory / (now().replace(":", "-").replace(".", "-") + "-" + str(uuid.uuid4()) + ".jsonl")
         self._error = None
+        self._pending, self._pending_bytes, self._scheduled = [], 0, None
         try:
             directory.mkdir(parents=True, exist_ok=True, mode=0o700)
             fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -66,7 +85,7 @@ class Journal:
                     sdkVersion=SDK_VERSION,
                     platform=sys.platform,
                     python=sys.version.split()[0],
-                    desktopMode=os.environ.get("COMPUTER_USE_DESKTOP", "shared"),
+                    globalInputAllowed=allow_global_input,
                 )
             )
         except Exception as error:
@@ -76,10 +95,58 @@ class Journal:
         if self._error is not None:
             return
         try:
+            line = dumps({"timestamp": now(), **event}) + "\n"
+            if event.get("kind") == "pipeline":
+                try:
+                    loop = get_running_loop()
+                except RuntimeError:
+                    self.flush(line)
+                    return
+                self._pending.append(line)
+                self._pending_bytes += len(line.encode("utf-8", "backslashreplace"))
+                if self._pending_bytes >= 64 * 1024:
+                    self.flush()
+                elif self._scheduled is None:
+                    self._scheduled = loop.call_soon(self.flush)
+            else:
+                # Progress, outputs and execution_end publish every prior trace.
+                self.flush(line)
+        except Exception as error:
+            self._error = str(error)
+
+    def record_observation(self, header_json, result_json):
+        """Append integrity-checked worker bytes without decoding native facts.
+
+        The worker transport validates the header and binds it to these exact
+        result bytes. All prior traces are published before the native result.
+        """
+        self.flush()
+        if self._error is not None:
+            return
+        try:
+            with self.path.open("ab") as file:
+                file.write(header_json[:-1])
+                file.write(b',"result":')
+                file.write(result_json)
+                file.write(b"}\n")
+        except Exception as error:
+            self._error = str(error)
+
+    def flush(self, line=""):
+        if self._scheduled is not None:
+            self._scheduled.cancel()
+            self._scheduled = None
+        payload = "".join(self._pending) + line
+        self._pending.clear()
+        self._pending_bytes = 0
+        if not payload or self._error is not None:
+            return
+        try:
             with self.path.open("a", encoding="utf-8", errors="backslashreplace") as file:
-                file.write(dumps({"timestamp": now(), **event}) + "\n")
+                file.write(payload)
         except Exception as error:
             self._error = str(error)
 
     def metadata(self):
+        self.flush()
         return dict(logError=self._error) if self._error is not None else dict(logPath=str(self.path))

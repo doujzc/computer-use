@@ -5,9 +5,10 @@ import ApplicationServices
 
 struct NativeInputQueryScope {
     let binding: (wire: [String: Any], blocked: [String], node: String?)
-    let desktop: Bool
     let selection: NativeSelectionBasis
     let scope: String
+    /// Borrowed by unit construction within this synchronous query.
+    var windowKeyboardScope: NativeInputScope? = nil
 }
 
 @MainActor struct NativeInputContextPlan {
@@ -28,4 +29,5 @@ struct NativeInputQueryScope {
     let nativeRole: String?
     let actionsComplete: Bool
     let applicationMenu: Bool
+    var webTypingRefusal: String? = nil
 }

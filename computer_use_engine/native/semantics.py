@@ -11,6 +11,7 @@ import re
 from collections.abc import Collection, Mapping
 from typing import Any
 
+
 # Missing/failed observations differ from a known absent or unsupported field.
 # This sentinel stays inside Python; it never enters a wire or display value.
 UNKNOWN = object()
@@ -216,6 +217,8 @@ WINDOWS_TEXT_LINE_FIELDS = {"Text.LineRanges": "textLineRanges"}
 
 # Viewport/geometry queries may enter expensive provider layout code. Normal
 # reads keep selection text; explicit native field queries can request these.
+WINDOWS_OBSERVATION_SCOPE_FIELDS = {"UIA.ReferenceScopeEvidence": "referenceScopeEvidence"}
+
 WINDOWS_ON_DEMAND_FIELDS = {"Text.VisibleRanges", "Text.SelectionBounds", "Text.StyleId"}
 
 # Additional collection-only facts retain their native names and value types.
@@ -311,6 +314,7 @@ FIELDS = {
         **WINDOWS_READ_V2_FIELDS,
         **WINDOWS_TEXT_CONTEXT_FIELDS,
         **WINDOWS_TEXT_LINE_FIELDS,
+        **WINDOWS_OBSERVATION_SCOPE_FIELDS,
     ),
     "linux": dict(
         role="role",
@@ -392,6 +396,7 @@ RELATIONS = {
         DescribedBy="describedBy",
         FlowsTo="flowsTo",
         FlowsFrom="flowsFrom",
+        **{"UIA.FocusedElement": "observedFocus", "UIA.PointElement": "observedPoint"},
     ),
     "linux": {
         "children": "children",
@@ -423,6 +428,8 @@ READ_RELATIONS = {
         "DescribedBy",
         "FlowsTo",
         "FlowsFrom",
+        "UIA.FocusedElement",
+        "UIA.PointElement",
     ),
     "linux": (
         "Table.viewportCandidates",
@@ -454,6 +461,7 @@ def followed_relations(platform, capabilities, *, content_only=False):
         "Table.viewportCandidates": "nativeTableViewport",
         "Text.Children": "nativeUiaReadV2",
         **{name: "nativeUiaTextContext" for name in ("DescribedBy", "FlowsTo", "FlowsFrom")},
+        **{name: "nativeReadDiscovery" for name in ("UIA.FocusedElement", "UIA.PointElement")},
     }
     platform_relations = relations.get(platform)
     if platform_relations is None:
@@ -547,13 +555,15 @@ def action_for_intent(
             return "AXPress"
         return None
     if intent == "click":
-        if role == "AXTextField":
-            # Text-field Press may report success without placing the caret.
-            # A physical element click retains ordinary file/grid selection
-            # semantics as well; AXOpen/Confirm are separate explicit actions.
+        if role in ("AXTextField", "AXCell"):
+            # Press can omit caret placement or open a cell editor. An
+            # ordinary click keeps mouse selection semantics for these roles.
             return None
         if "AXPress" in actions:
             return "AXPress"
+        leaf_menu_item = complete and role == "AXMenuItem" and not has_submenu
+        if leaf_menu_item and sum(action == "AXPick" for action in actions) == 1:
+            return "AXPick"
         # Absence of Press must be known, not inferred from a partial catalogue.
         if complete and role in ("AXPopUpButton", "AXMenuButton", "AXComboBox") and "AXShowMenu" in actions:
             return "AXShowMenu"
@@ -667,6 +677,29 @@ def direct_editor(role, values, *, platform=None):
     )
 
 
+def keyboard_input_evidence(role, values, *, platform=None):
+    """Text input semantics are independent of writable accessibility buffers.
+
+    A macOS text field/area can receive keyboard text while its exposed value
+    and selected text are read-only snapshots (for example a terminal stream).
+    Its declared text role and focus capability qualify receiver resolution;
+    the native keyboard contract still prepares and rechecks the exact target.
+    This does not authorize whole-buffer replacement or a generic focused view.
+    """
+    editing = editing_evidence(role, values, platform=platform)
+    focusable_text_field = (
+        platform == "macos" and role in ("textField", "textArea") and values.get("focusWritable") is True
+    )
+    accepts_input = (
+        focusable_text_field
+        and values.get("enabled") is not False
+        and values.get("editable") is not False
+    )
+    if accepts_input and values.get("readOnly") is not True and values.get("textReadOnly") is not True:
+        return True
+    return editing
+
+
 def preparable_editor(role, values, *, platform=None):
     """An identified text control may expose editing only after native focus.
 
@@ -720,6 +753,17 @@ def input_container(platform: str, node: Mapping[str, Any]) -> bool:
     )
 
 
+def observation_scope_evidence(value):
+    """Validate input-route provenance without importing a platform read adapter."""
+    return (
+        isinstance(value, dict)
+        and set(value) == {"ownership", "input", "detail"}
+        and value.get("ownership") in ("confirmed", "unknown", "outside")
+        and value.get("input") in ("liveValidation", "observationOnly")
+        and isinstance(value.get("detail"), str)
+    )
+
+
 def control_capabilities(platform, node, driver_features=(), *, scope_kind=None):
     """Observed semantic support; live scope/receiver checks still apply.
 
@@ -729,6 +773,16 @@ def control_capabilities(platform, node, driver_features=(), *, scope_kind=None)
     Unknown capabilities do not erase native fields or actions.
     """
     caps = {key: "unknown" for key in ("click", "typeText", "replaceText", "focus")}
+    if scope_kind == "applicationContent":
+        return dict.fromkeys(caps, "unavailable")
+    if platform == "windows":
+        scope = node["values"].get("UIA.ReferenceScopeEvidence")
+        if (
+            observation_scope_evidence(scope)
+            and scope["input"] == "observationOnly"
+            and "UIA.ReferenceScopeEvidence" not in node["fieldStatus"]
+        ):
+            return {key: "unavailable" for key in caps}
     values = control_values(platform, node)
     if values["enabled"] is False:
         return {key: "unavailable" for key in caps}
@@ -857,6 +911,7 @@ def control_capabilities(platform, node, driver_features=(), *, scope_kind=None)
                 raw_role not in ("AXMenuBar", "AXMenuBarItem", "AXMenuItem", "AXMenu")
                 or scope_kind == "applicationMenu"
                 and "nativeMenuActions" in driver_features
+                and any(action["name"] == "AXPress" for action in actions["items"])
             )
             and action_for_intent(
                 platform, raw_role, [a["name"] for a in actions["items"]], actions["state"] == "complete", "click"
@@ -869,10 +924,15 @@ def control_capabilities(platform, node, driver_features=(), *, scope_kind=None)
         caps["click"] = "available"
     if "nativeKeyboardIntents" in driver_features and values["focusWritable"] is True:
         caps["focus"] = "available"
-    if (
+    can_type_text = (
         "nativeTextInput" in driver_features
         and "nativeActuators" in driver_features
-        and direct_editor(role, values, platform=platform)
-    ):
+        and (
+            direct_editor(role, values, platform=platform)
+            or role in ("textField", "textArea")
+            and keyboard_input_evidence(role, values, platform=platform) is True
+        )
+    )
+    if can_type_text:
         caps["typeText"] = "available"
     return caps

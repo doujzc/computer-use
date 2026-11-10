@@ -10,7 +10,8 @@ import ApplicationServices
             throw DriverError("desktop capture needs this session's read scope", code: .invalidRequest)
         }
         let interval = CaptureInterval()
-        var result = try await scopes.desktop().read(maxDimension: request.maxDimension)
+        var result = try await scopes.desktop().read(
+            maxDimension: request.maxDimension, retainedCaptures: request.retainedCaptures ?? [], retainWindow: scopes.retainDesktopWindow)
         result["kind"] = "desktopCapture"
         result["binding"] = request.target
         result["observed"] = interval.observation()

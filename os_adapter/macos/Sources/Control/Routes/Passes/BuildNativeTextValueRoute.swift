@@ -13,7 +13,18 @@ import ApplicationServices
         let kind = context.command.kind
         let intentKind = context.operation.request.kind
         let receipt = context.receipt
-        let beforeDispatch = context.boundary.beforeDispatch
+        func beforeDispatch() throws {
+            guard case .geckoAtomicFullReplacement(let proof) = valueContract.semantics else {
+                return try context.boundary.beforeDispatch()
+            }
+            try context.boundary.checkConditions()
+            // AXValue can take focus. Recheck after the scope queries and
+            // before marking any requested input in flight.
+            guard NativeGeckoTextProvider.focused(proof) else {
+                throw NativeRouteUnavailable(description: "the original replacement receiver lost focus before dispatch")
+            }
+            try context.boundary.markDispatchInFlight()
+        }
 
         return .dispatch {
             let request = try NativeObjectIntent(unit: kind, kind: intentKind, parameters: op.request.parameters)
@@ -21,7 +32,8 @@ import ApplicationServices
                 throw DriverError("native text contract mismatch", code: .invalidRequest)
             }
             let edited = try context.access.objects.executeNativeTextValue(
-                node, contract: valueContract, text: text, onDispatch: beforeDispatch)
+                node, contract: valueContract, text: text, onDispatch: beforeDispatch,
+                originalWindow: { try context.access.scopes.fixedInputWindow(context.command.target)?.window })
             receipt.detail = edited.detail
             receipt.confirmation = edited.verified ? "confirmed" : "unavailable"
             return false

@@ -22,7 +22,7 @@ def text_intent(value):
     require(
         value["kind"] in ("insert", "replace"),
         "This Linux v5 driver currently implements only native text insertion/replacement.",
-        "mode_unsupported",
+        "unsupported_operation",
     )
     parameters = fields(value["parameters"], ("text",))
     text = string(parameters["text"], empty=True)
@@ -100,7 +100,7 @@ class NativeText:
         pending = [] if enabled else ["enabled"]
         if supported and kind == "insert":
             try:
-                codec = text_codec(self.ax, obj)
+                codec = text_codec(self.ax, obj, text=operation.intent["parameters"]["text"])
                 codec.insertion_length(operation.intent["parameters"]["text"])
             except (Failure, self.ax.glib.Error):
                 ctx.check()
@@ -122,6 +122,7 @@ class NativeText:
                 id=identifier,
                 unit="native_text_edit",
                 channel="object",
+                globalInput="no",
                 supported="yes",
                 readiness="yes" if ready else "no",
                 pending=pending,

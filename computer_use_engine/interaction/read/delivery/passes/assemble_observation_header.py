@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 from computer_use.interaction.read.delivery.model import ObservationDraft
 from computer_use.interaction.read.numbering.observation.model import RenderedObservation
+from computer_use.interaction.read.presentation.document import DisplayDocument
 from computer_use.pipeline import Contract, Effect, Pass
 
 if TYPE_CHECKING:
@@ -24,11 +25,13 @@ def create(*, services: NativeAppReader) -> Callable[[RenderedObservation, Contr
         """Format the acquisition header and build its element-binding and window-alias maps."""
         acquired, rendered = value.acquired, value.rendered
         plan, components = acquired.plan, acquired.components
+        if plan.scope_managed:
+            # The interface collector owns aliases and projection for the
+            # complete capture. Leave the component snapshots intact.
+            return ObservationDraft(value, {}, {}, DisplayDocument.join(()), components.overview)
         target, directory = acquired.target, acquired.directory
-        refs = {
-            ref: replace(target, node=node, capture=None)
-            for ref, node in (rendered.snapshot.refs.items() if rendered else ())
-        }
+        tree_refs = components.tree.refs.items() if components.tree is not None and value.snapshots_numbered else ()
+        refs = {ref: replace(target, node=node, capture=None) for ref, node in tree_refs}
         windows = services.window_aliases(directory)
         # The pipeline shares retained bindings with their owning service.
         # pylint: disable-next=protected-access

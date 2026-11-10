@@ -9,6 +9,7 @@ import logging
 import os
 import time
 
+from computer_use_linux.contracts.input_authority import require_global_input
 from computer_use_linux.contracts.protocol import Failure, finite, integer, now, require, token
 from computer_use_linux.objects.registry import Window
 from computer_use_linux.system.x11_pointer import PointerCallbacks
@@ -26,11 +27,13 @@ class X11:
     notes = []
     _resource_version = _RESOURCE_UNQUERIED
 
-    def __init__(self, mode, retire):
+    def __init__(self, retire, *, allow_global_input=False):
+        require(allow_global_input is True or allow_global_input is False, "Global input permission must be a boolean.")
+        self.allow_global_input = allow_global_input
         if os.environ.get("XDG_SESSION_TYPE") == "wayland" or os.environ.get("WAYLAND_DISPLAY"):
             raise Failure(
                 "This backend currently requires an X11 desktop; XWayland is not a complete desktop route.",
-                "mode_unsupported",
+                "unsupported_operation",
                 next="Use an X11 desktop session or an isolated X11 VM for this version.",
             )
         if not os.environ.get("DISPLAY"):
@@ -44,11 +47,10 @@ class X11:
         self.d = display.Display()
         self.screen = self.d.screen()
         self.root = self.screen.root
-        self.mode, self.retire = mode, retire
+        self.retire = retire
         self.keys, self.buttons = set(), set()
         self.watched = set()
         self.window_captures = None
-        self.assist = os.environ.get("COMPUTER_USE_FOREGROUND_ASSIST") == "1"
         self.can_input = self.d.has_extension("XTEST")
         self.root.change_attributes(event_mask=X.SubstructureNotifyMask)
         self.d.sync()
@@ -213,29 +215,18 @@ class X11:
 
     def prepare(self, instance, ctx, pointer=False):
         if not self.can_input:
-            raise Failure("XTest is unavailable; native accessibility actions remain available.", "mode_unsupported")
+            raise Failure(
+                "XTest is unavailable; native accessibility actions remain available.",
+                "unsupported_operation",
+            )
         w = self.validate(instance)
         if not w.mapped:
             raise Failure("Window is not visible; restore it before using visual input.", "input_unavailable")
-        if pointer and self.mode == "shared" and not self.assist:
-            raise Failure(
-                (
-                    "X11 pointer input moves the shared pointer. Use a native element action or "
-                    "authorize foreground "
-                    "assistance."
-                ),
-                "mode_unsupported",
-            )
         if pointer and w.override_redirect:
             # Menus/tooltips are not managed keyboard-focus windows. Pointer
             # routing uses their actual topmost hit target, never keyboard focus.
             return w
         if self.active() != w.key or not self.focus_belongs(w.key):
-            if self.mode != "exclusive" and not self.assist:
-                raise Failure(
-                    "No background keyboard route to this window. Native element text input may still work.",
-                    "mode_unsupported",
-                )
             self.activate(w, ctx)
         self.validate(instance)
         return w
@@ -260,7 +251,7 @@ class X11:
     def expose(self, instance, point, ctx, *, is_reachable=None):
         """Request the selected window's exposure for pointer input, not keys.
 
-        The caller owns mode admission and records the preparation attempt.
+        The caller selects exposure and records the preparation attempt.
         A window can receive pointer input without owning keyboard focus. Its
         current hit route, checked after the activation request, is the relevant
         readiness fact. Capture/element identity and geometry are checked again
@@ -274,8 +265,8 @@ class X11:
             self.validate(instance)
             if is_reachable is not None:
                 # Element geometry may legitimately move during preparation.
-                # The caller resamples the same binding; capture routes instead
-                # retain their original coordinates and reject geometry drift.
+                # Capture routes retain the original PNG offsets and size,
+                # resolving only client-origin translation before delivery.
                 if is_reachable():
                     return
                 ctx.pause()
@@ -497,15 +488,30 @@ class X11:
             capture["stopReasons"] = notes
         return capture, (x, y, native_width / image.width, native_height / image.height)
 
-    def point(self, capture, x, y):
+    def points(self, capture, pairs, *, current=None):
+        """Map original PNG pixels using one current client-window sample.
+
+        The capture's size and pixel scale stay fixed. Translation is resolved
+        before delivery; the caller freezes and guards the resulting gesture.
+        """
         if not capture.image:
             raise Failure("No captured image establishes these coordinates.", "stale_target")
-        if not (0 <= x < capture.image["width"] and 0 <= y < capture.image["height"]):
-            raise Failure("Coordinates are outside the captured image.", "invalid_request")
+        for x, y in pairs:
+            if not (0 <= x < capture.image["width"] and 0 <= y < capture.image["height"]):
+                raise Failure("Coordinates are outside the captured image.", "invalid_request")
+        ox, oy, sx, sy = capture.transform
         if capture.instance:
-            current = self.validate(capture.instance)
-            if current.rect != capture.window.rect:
-                raise Failure("Window geometry changed since capture.", "stale_target")
+            current = self.validate(capture.instance) if current is None else current
+            require(
+                capture.instance.alive
+                and (current.key, current.pid, current.process_start)
+                == (capture.window.key, capture.window.pid, capture.window.process_start),
+                "The original captured window identity changed.",
+                "stale_target",
+            )
+            if current.rect[2:] != capture.window.rect[2:]:
+                raise Failure("Window size changed since capture.", "stale_target")
+            ox, oy = current.rect[:2]
         else:
             geom = self.root.get_geometry()
             if (geom.width, geom.height) != (
@@ -513,10 +519,13 @@ class X11:
                 round(capture.image["height"] * capture.transform[3]),
             ):
                 raise Failure("Desktop geometry changed since capture.", "stale_target")
-        ox, oy, sx, sy = capture.transform
-        return round(ox + x * sx), round(oy + y * sy)
+        return tuple((round(ox + x * sx), round(oy + y * sy)) for x, y in pairs)
+
+    def point(self, capture, x, y):
+        return self.points(capture, ((x, y),))[0]
 
     def _event(self, kind, detail=0, x=0, y=0):
+        require_global_input(self)
         from Xlib.ext import xtest
 
         errors = []
@@ -557,8 +566,9 @@ class X11:
         return code
 
     def press_key(self, key, ctx, validate=lambda: None, before_dispatch=lambda: None):
+        require_global_input(self)
         if not self.can_input:
-            raise Failure("XTest keyboard synthesis is unavailable.", "mode_unsupported")
+            raise Failure("XTest keyboard synthesis is unavailable.", "unsupported_operation")
         parts = key.split("+")
         codes = [self.keycode(name) for name in parts]
         self.require_idle_input()
@@ -583,12 +593,15 @@ class X11:
         from computer_use_linux.system.x11_text import keyboard_for, plan_text
 
         if not self.can_input:
-            raise Failure("XTest keyboard synthesis is unavailable.", "mode_unsupported")
+            raise Failure("XTest keyboard synthesis is unavailable.", "unsupported_operation")
         return plan_text(text, keyboard_for(self).snapshot())
 
     def type_text(self, text, ctx, validate=lambda: None, before_dispatch=lambda: None, before_character=lambda: None):
         from computer_use_linux.system.x11_text import check_plan, keyboard_for
 
+        if text == "":
+            return
+        require_global_input(self)
         plan = self.text_preflight(text)  # Entire payload before any key press.
         keyboard = keyboard_for(self)
         self.require_idle_input()
@@ -639,7 +652,7 @@ class X11:
         any higher-level receiver preparation.
         """
         if not self.can_input:
-            raise Failure("XTest pointer synthesis is unavailable.", "mode_unsupported")
+            raise Failure("XTest pointer synthesis is unavailable.", "unsupported_operation")
         require(kind in ("click", "scroll", "drag"), "Invalid pointer operation.")
         require(button in ("left", "middle", "right"), "Invalid pointer button.")
         integer(count, 1, 2)
@@ -703,14 +716,27 @@ class X11:
         drag button is down, validate_drag checks its continuing scope without
         requiring the original hit/layout: X11's implicit grab routes the gesture.
         Releases are cleanup and never depend on a surviving target or request.
+        freeze_points, when supplied, resolves the whole gesture once; later
+        validation never supplies replacement coordinates to the event plan.
         """
+        require_global_input(self)
         callbacks = PointerCallbacks() if callbacks is None else callbacks
         validate, before_dispatch = callbacks.validate, callbacks.before_dispatch
         validate_drag, scroll_step_complete = callbacks.validate_drag, callbacks.scroll_step_complete
         event_progress = callbacks.event_progress
-        plan = self.pointer_preflight(kind, points, button, count, direction, pages)
+        # Existing callers already supply fixed points. Capture routes resolve
+        # all local offsets together after preparation/idle admission, before
+        # building the single plan that every event in this train consumes.
+        plan = (
+            self.pointer_preflight(kind, points, button, count, direction, pages)
+            if callbacks.freeze_points is None
+            else None
+        )
         ctx.check()
         self.require_idle_input()
+        if callbacks.freeze_points is not None:
+            points = callbacks.freeze_points()
+            plan = self.pointer_preflight(kind, points, button, count, direction, pages)
         validate()
         ctx.check()
         number = plan["button"]
@@ -757,7 +783,7 @@ class X11:
             else:
                 self.release(event_progress=event_progress)
 
-    # The legacy pointer adapter forwards the same atomic gesture and validation contract.
+    # Forward the same atomic gesture and validation contract.
     # pylint: disable-next=too-many-arguments
     def pointer(
         self,
@@ -772,12 +798,6 @@ class X11:
         before_dispatch=lambda: None,
         validate_drag=None,
     ):
-        # v3 keeps its historical shared-pointer policy. v5's explicit contract
-        # authorizes the sequence and handles blocked routes before reaching it.
-        if self.mode == "shared" and not self.assist:
-            raise Failure(
-                "Shared X11 visual pointer input requires host foreground-assist authorization.", "mode_unsupported"
-            )
         return self.pointer_sequence(
             kind,
             points,

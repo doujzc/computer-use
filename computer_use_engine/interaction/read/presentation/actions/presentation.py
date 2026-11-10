@@ -20,8 +20,8 @@ class ActionPresentation:
     def has(self, receipt: Record) -> bool:
         return self._receipts.get(id(receipt)) is receipt
 
-    def render(self, receipt: Record) -> str:
-        """Format an action receipt, deduplicating repeated details within this tool result."""
+    def render(self, receipt: Record) -> tuple[int, str]:
+        """Return the receipt ordinal and text, deduplicating repeated details."""
         number, previous = self._next, self._details.get(receipt["detail"])
         self._next += 1
         detail = receipt["detail"] if previous is None else f"Result detail: same as action #{previous}."
@@ -42,4 +42,5 @@ class ActionPresentation:
                     desktop_line = f"\nDesktop #{identifier}: {facts}"
         self._details[receipt["detail"]] = previous if previous is not None else number
         self._receipts[id(receipt)] = receipt
-        return f"Action [{receipt['status']}]: #{number} {receipt['target']}. {detail}{desktop_line}"
+        intent = f" / {receipt['intent']}" if receipt.get("intent") else ""
+        return number, f"Action [{receipt['status']}]: #{number} {receipt['target']}{intent}. {detail}{desktop_line}"

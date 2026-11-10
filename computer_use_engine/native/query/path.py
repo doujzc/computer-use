@@ -16,7 +16,7 @@ from computer_use.native.semantics import RELATIONS, followed_relations, role_na
 from computer_use.protocol.element_path import element_path
 
 
-async def resolve_path(port, operation, root, remaining, path, *, timeout_ms=0):
+async def resolve_path(port, operation, root, remaining, path, *, timeout_ms=0, strict_window=False):
     """Wait only for absence, within the same lease and total call deadline.
 
     A zero timeout means one lookup, not zero time for native IPC. Each retry
@@ -29,7 +29,7 @@ async def resolve_path(port, operation, root, remaining, path, *, timeout_ms=0):
         raise ValueError("Path wait must be an integer in 0..10000 milliseconds")
     deadline = asyncio.get_running_loop().time() + timeout_ms / 1000
     while True:
-        query = TargetQuery(port, operation, root, remaining)
+        query = TargetQuery(port, operation, root, remaining, strict_window=strict_window)
         try:
             return await query.resolve(path), query.within
         except ComputerUseError as error:
@@ -41,9 +41,11 @@ async def resolve_path(port, operation, root, remaining, path, *, timeout_ms=0):
 
 class TargetQuery(NativeGraph):
     failure_target = "element path"
-    failure_next = "read this working window and narrow the path or use an observed element"
+    fields_for_path = (
+        "role", "name", "description", "identifier", "subrole", "focused", "modal", "value", "nativeWindowHandle",
+    )
 
-    def __init__(self, port, operation, root, remaining, *, max_nodes=4096, max_depth=40):
+    def __init__(self, port, operation, root, remaining, *, max_nodes=4096, max_depth=40, strict_window=False):
         contents = followed_relations(port.platform, getattr(port, "capabilities", ()), content_only=True)
         super().__init__(
             port,
@@ -52,21 +54,13 @@ class TargetQuery(NativeGraph):
             remaining,
             max_nodes=max_nodes,
             max_depth=max_depth,
-            fields=(
-                "role",
-                "name",
-                "description",
-                "identifier",
-                "subrole",
-                "focused",
-                "modal",
-                "value",
-                "nativeWindowHandle",
-            )
+            fields=self.fields_for_path
             + (("windowContentScope",) if "nativeWindowContent" in getattr(port, "capabilities", ()) else ()),
             follow_relations=contents,
         )
         self.content_kinds = tuple(RELATIONS[self.platform][name] for name in contents)
+        if strict_window:
+            self.query_options["strict_window"] = True
         self.within = ()
 
     async def _name(self, token):
@@ -141,7 +135,46 @@ class TargetQuery(NativeGraph):
             children.extend(await self._relation(token, kind, read_missing=True, optional=True))
         # Rows/cells can be shared by several content relations or span several
         # coordinates. They are one native candidate, not repeated matches.
-        return tuple(dict.fromkeys(children))
+        unique = dict.fromkeys(children)
+        if not self.outside_window_nodes:
+            return tuple(unique)
+        return tuple(child for child in unique if child not in self.outside_window_nodes)
+
+    async def _next_relation(self, token, relation_property, cursor, limit):
+        page, batch = await super()._next_relation(token, relation_property, cursor, limit)
+        first_children_page = (
+            self.platform == "macos" and relation_property == self.relations["children"] and cursor is None
+        )
+        if not first_children_page or batch is None:
+            return page, batch
+        if page["relation"]["state"] != "complete" or page["relation"]["certainty"] != "confirmed":
+            return page, batch
+        # A first Children page also follows its source's requested content
+        # relations. Accept only complete same-source rows for relations whose
+        # earlier depth-limited sample had a count and no consumed identities.
+        collected = {node["node"] for node in batch["nodes"]}
+        for edge in batch["relations"]:
+            prop = edge["property"]
+            key = token, prop
+            previous = self.edges.get(key)
+            if edge["source"] != token or prop not in self.follow_relations or key in self.completed_edges:
+                continue
+            if previous is None or previous["state"] != "partial" or previous["certainty"] != "confirmed":
+                continue
+            has_consumed_identities = (
+                previous["targets"] or previous.get("offset", 0) or previous.get("cursor") is not None
+            )
+            if has_consumed_identities or previous.get("unavailablePositions") or previous.get("membershipObservedAt"):
+                continue
+            if edge["state"] != "complete" or edge["certainty"] != "confirmed" or not edge["targets"]:
+                continue
+            if len(edge["targets"]) != previous.get("total") or edge.get("total") != previous.get("total"):
+                continue
+            if any(ref not in self.nodes and ref not in collected for ref in edge["targets"]):
+                continue
+            self.edges[key] = edge
+            self.edge_sources[key].append(batch["observed"]["id"])
+        return page, batch
 
     async def _inline_window(self, token, role):
         if (
@@ -169,23 +202,47 @@ class TargetQuery(NativeGraph):
         path = element_path(path)
         if self.root.node is None or self.root.capture is not None:
             raise ValueError("A path query needs an observed accessible root")
+        if self.platform == "macos" and "nativeQueryActionProfile" in getattr(self.port, "capabilities", ()):
+            self.query_options["action_detail"] = "none" if len(path) == 1 else "names"
+            if len(path) == 1:
+                # The first path step explores every candidate directly. Only
+                # later steps test anonymous wrappers through _transparent.
+                fields = ["role"]
+                if "name" in path[0]:
+                    fields.extend(("name", "description", "value"))
+                if "identifier" in path[0]:
+                    fields.append("identifier")
+                self.fields = tuple(fields)
         selected = self.root.node
         anchors = [selected]
         for step, condition in enumerate(path):
             candidates = [self.root.node] if step == 0 else await self._contents(selected)
             found, visited, incomplete = [], set(), False
-            stack = [(node, (), 0) for node in reversed(candidates)]
+            # Native depth limits each collection. The logical search shares
+            # the graph's node and time budgets across all of its collections.
+            active = set()
+            stack = [(node, True) for node in reversed(candidates)]
             while stack:
+                token, entering = stack.pop()
+                if not entering:
+                    active.remove(token)
+                    continue
                 self.remaining()
-                token, ancestors, depth = stack.pop()
-                if token in ancestors or depth > self.max_depth:
-                    self.fail("observation_incomplete", "Path containment is cyclic or exceeds its budget.")
+                if token in active:
+                    self.fail("observation_incomplete", "Path containment is cyclic.")
                 if token in visited:
                     continue  # One shared native object is still one candidate.
                 if len(visited) >= self.max_nodes:
                     self.fail("observation_incomplete", "Path containment exceeds its node budget.")
                 visited.add(token)
-                raw_role = await self._field(token, "role")
+                if token in self.outside_window_nodes:
+                    continue
+                try:
+                    raw_role = await self._field(token, "role")
+                except ComputerUseError as error:
+                    if self.query_options.get("strict_window") and error.code == "outside_window_scope":
+                        continue
+                    raise
                 role = role_name(self.platform, raw_role) if raw_role is not UNKNOWN else "unknown"
                 if token != self.root.node and role in ("window", "sheet"):
                     inline = await self._inline_window(token, role)
@@ -194,7 +251,7 @@ class TargetQuery(NativeGraph):
                         # in this working window. It cannot prove uniqueness in
                         # another branch, or a complete negative lookup.
                         incomplete |= inline is None
-                        continue  # Select independent surfaces via App.window().
+                        continue  # Select independent surfaces via App methods' window= parameter.
                 matched = await self._matches(token, condition)
                 incomplete |= matched is None
                 if matched is True:
@@ -213,7 +270,9 @@ class TargetQuery(NativeGraph):
                 incomplete |= descend is None
                 if descend is True:
                     children = await self._contents(token)
-                    stack.extend((child, (*ancestors, token), depth + 1) for child in reversed(children))
+                    active.add(token)
+                    stack.append((token, False))
+                    stack.extend((child, True) for child in reversed(children))
             if incomplete:
                 self.fail(
                     "observation_incomplete",

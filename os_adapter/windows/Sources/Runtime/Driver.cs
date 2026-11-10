@@ -12,15 +12,18 @@ namespace ComputerUse.Windows
 {
     internal sealed class Driver
     {
-        readonly string session, mode;
-        readonly object gate = new object (), output = new object ();
+        readonly string session;
+        bool globalInputAllowed;
+        readonly object gate = new object(), output = new object();
         readonly BlockingCollection<Action> work = new BlockingCollection<Action>();
-        readonly Dictionary<long, string> requests = new Dictionary<long, string>(), replies = new Dictionary<long, string>();
+        readonly Dictionary<long, string> requests = new Dictionary<long, string>(),
+                                          replies = new Dictionary<long, string>();
         readonly Queue<long> order = new Queue<long>();
-        readonly Func<string, string, INativeRuntime> createRuntime;
+        readonly Func<string, bool, INativeRuntime> createRuntime;
         readonly Func<object> checkpoint;
         readonly Func<bool> recycle;
         readonly Func<object> pointerCheckpoint;
+        readonly Func<string, object> captureCheckpoint;
         readonly Action stopDisplay;
         object latestCheckpoint;
         INativeRuntime native;
@@ -29,7 +32,10 @@ namespace ComputerUse.Windows
         volatile bool hello, stopping, negotiating;
         int bytes;
         CancellationTokenSource cancellation;
-        internal Driver(Func<string, string, INativeRuntime> createRuntime, string session = null, Func<object> checkpoint = null, Func<bool> recycle = null, Func<object> pointerCheckpoint = null, Action stopDisplay = null)
+        internal Driver(Func<string, bool, INativeRuntime> createRuntime, string session = null,
+                        Func<object> checkpoint = null, Func<bool> recycle = null,
+                        Func<object> pointerCheckpoint = null, Action stopDisplay = null,
+                        Func<string, object> captureCheckpoint = null)
         {
             if (createRuntime == null)
                 throw new ArgumentNullException("createRuntime");
@@ -38,8 +44,8 @@ namespace ComputerUse.Windows
             this.checkpoint = checkpoint;
             this.recycle = recycle;
             this.pointerCheckpoint = pointerCheckpoint;
+            this.captureCheckpoint = captureCheckpoint;
             this.stopDisplay = stopDisplay;
-            mode = Environment.GetEnvironmentVariable("COMPUTER_USE_DESKTOP") ?? "shared";
         }
 
         void Write(string line)
@@ -63,18 +69,24 @@ namespace ComputerUse.Windows
             response["version"] = version;
             response["session"] = session;
             response["id"] = id;
-            string line = Wire.Json(response);
             if (checkpoint != null)
             {
-                response["windowCheckpoint"] = latestCheckpoint ?? new object[0];
-                response["recycleReadWorker"] = recycle != null && recycle();
-                line = Wire.Json(response);
-                if (pointerCheckpoint != null)
+                var health = native as INativeWorkerHealthStatus;
+                string retirement = health == null ? null : health.WorkerRetirementReason;
+                if (retirement != null)
                 {
-                    response["pointerCheckpoint"] = pointerCheckpoint();
-                    line = Wire.Json(response);
+                    // Private child envelope only; no provider callbacks are safe.
+                    response["workerRetirement"] = Wire.Obj("reason", retirement, "cleanup", "failed");
+                }
+                else
+                {
+                    response["windowCheckpoint"] = latestCheckpoint ?? new object[0];
+                    response["recycleReadWorker"] = recycle != null && recycle();
+                    if (pointerCheckpoint != null)
+                        response["pointerCheckpoint"] = pointerCheckpoint();
                 }
             }
+            string line = Wire.Json(response);
 
             lock (gate)
             {
@@ -99,7 +111,9 @@ namespace ComputerUse.Windows
 
         object Error(string code, string detail, string effect = "none", Request r = null)
         {
-            var d = Wire.Obj("code", code, "target", r == null ? "request" : r.Target, "effect", effect, "detail", detail, "next", "observe current state before continuing; never automatically replay uncertain input");
+            var d =
+                Wire.Obj("code", code, "target", r == null ? "request" : r.Target, "effect", effect, "detail", detail,
+                         "next", "observe current state before continuing; never automatically replay uncertain input");
             return Wire.Obj("error", d);
         }
 
@@ -136,7 +150,8 @@ namespace ComputerUse.Windows
                 if (p.ContainsKey("cancel"))
                 {
                     Wire.Keys(p, "version,session,cancel");
-                    if (Wire.Num(p, "version", version, version, true) != version || !hello || Wire.Str(p, "session") != session)
+                    if (Wire.Num(p, "version", version, version, true) != version || !hello ||
+                        Wire.Str(p, "session") != session)
                         throw new FormatException("invalid cancellation session");
                     long cancelled = (long)Wire.Num(p, "cancel", 1, 9007199254740991, true);
                     lock (gate)
@@ -164,31 +179,32 @@ namespace ComputerUse.Windows
                     if (Wire.Str(p, "method") != "hello")
                         throw new Failure("invalid_request", "id zero is reserved for hello");
                     var options = Wire.Object(p["params"]);
-                    Wire.Keys(options, "desktopMode");
-                    if (!(mode == "shared" || mode == "exclusive") || Wire.Str(options, "desktopMode") != mode)
-                    {
-                        Reply(0, Error("mode_mismatch", "host desktop mode differs from requested mode"));
-                        return;
-                    }
+                    Wire.Keys(options, "globalInputAllowed");
+                    if (!(options["globalInputAllowed"] is bool))
+                        throw new Failure("invalid_request", "globalInputAllowed must be a boolean");
+                    globalInputAllowed = (bool)options["globalInputAllowed"];
 
                     // All UIA construction and use belongs to the same
                     // windowless MTA worker, including future COM providers.
                     negotiating = true;
                     work.Add(() =>
-                    {
-                        try
-                        {
-                            native = createRuntime(session, mode);
-                            hello = true;
-                            negotiating = false;
-                            Reply(0, Wire.Obj("result", Wire.Obj("platform", "windows", "desktopMode", mode, "maxTimeoutMs", 120000, "capabilities", native.Capabilities)));
-                        }
-                        catch (Exception error)
-                        {
-                            negotiating = false;
-                            Reply(0, Error("execution_failed", "native initialization failed: " + error.Message));
-                        }
-                    });
+                             {
+                                 try
+                                 {
+                                     native = createRuntime(session, globalInputAllowed);
+                                     hello = true;
+                                     negotiating = false;
+                                     Reply(0, Wire.Obj("result", Wire.Obj("platform", "windows", "globalInputAllowed", globalInputAllowed,
+                                                                          "maxTimeoutMs", 120000, "capabilities",
+                                                                          native.Capabilities)));
+                                 }
+                                 catch (Exception error)
+                                 {
+                                     negotiating = false;
+                                     Reply(0,
+                                           Error("execution_failed", "native initialization failed: " + error.Message));
+                                 }
+                             });
                     return;
                 }
 
@@ -214,13 +230,15 @@ namespace ComputerUse.Windows
                         else if (replies.ContainsKey(current))
                             Write(replies[current]);
                         else
-                            Reply(current, Error("in_progress", "request already executing; no duplicate dispatched", "possible"));
+                            Reply(current, Error("in_progress", "request already executing; no duplicate dispatched",
+                                                 "possible"));
                         return;
                     }
 
                     if (current <= high)
                     {
-                        Reply(current, Error("request_expired", "request result no longer retained; no duplicate dispatched", "possible"));
+                        Reply(current, Error("request_expired",
+                                             "request result no longer retained; no duplicate dispatched", "possible"));
                         return;
                     }
 
@@ -234,7 +252,7 @@ namespace ComputerUse.Windows
 
                     active = current;
                     cancellation = new CancellationTokenSource();
-                    var request = new Request(cancellation.Token, timeout);
+                    var request = new Request(cancellation.Token, timeout, globalInputAllowed);
                     work.Add(() => Execute(current, method, parameters, request));
                 }
             }
@@ -256,24 +274,28 @@ namespace ComputerUse.Windows
             try
             {
                 r.Check();
-                if (!new[]
-                {
-                    "begin",
-                    "inspect",
-                    "capture",
-                    "execute",
-                    "finish"
-                }.Contains(method))
-                    throw new Failure("invalid_request", "method '" + method + "' is not supported by protocol v5");
+                if (!new[] { "begin", "inspect", "capture", "prepareObservation", "execute", "finish" }.Contains(method))
+                    throw new Failure("invalid_request", "method '" + method + "' is not supported by protocol 6");
                 var result = native.Perform(method, p, r);
                 // Units journal cancellation after possible dispatch in their
                 // receipt. Do not replace that receipt with a generic error.
-                response = Wire.Obj("result", result);
+                var completed = Wire.Obj("result", result);
+                if (method == "capture" && captureCheckpoint != null)
+                {
+                    var captured = Wire.Object(result);
+                    string captureId = Equals(captured["kind"], "desktopCapture") ? (string)captured["desktopRef"]
+                                       : (string)Wire.Object(captured["image"])["id"];
+                    completed["captureCheckpoint"] = captureCheckpoint(captureId);
+                }
+                response = completed;
             }
             catch (Exception error)
             {
                 var failure = error as Failure;
-                var code = failure == null ? (error is System.Windows.Automation.ElementNotAvailableException ? "stale_target" : "execution_failed") : failure.Code;
+                var code = failure == null
+                               ? (error is System.Windows.Automation.ElementNotAvailableException ? "stale_target"
+                                                                                                  : "execution_failed")
+                               : failure.Code;
                 response = Error(code, error.Message, r.Dispatched ? "partial" : r.Effect ? "possible" : "none", r);
                 if (failure != null)
                     Wire.Object(Wire.Object(response)["error"])["next"] = failure.Next;
@@ -281,7 +303,8 @@ namespace ComputerUse.Windows
 
             // Publish only after input cleanup and lease release; the client may
             // immediately send its next command when it receives this response.
-            if (checkpoint != null)
+            var health = native as INativeWorkerHealthStatus;
+            if (checkpoint != null && (health == null || health.WorkerRetirementReason == null))
                 latestCheckpoint = checkpoint();
             lock (gate)
             {
@@ -300,47 +323,49 @@ namespace ComputerUse.Windows
                 e.Cancel = true;
                 Stop();
             };
-            var reader = new Thread(() =>
-            {
-                try
-                {
-                    using (var input = new StreamReader(Console.OpenStandardInput(), new UTF8Encoding(false, true), false, 8192))
-                    {
-                        var buffer = new char[8192];
-                        var pending = new StringBuilder();
-                        int count;
-                        while (!stopping && (count = input.Read(buffer, 0, buffer.Length)) > 0)
-                        {
-                            for (int i = 0; i < count; i++)
-                            {
-                                if (buffer[i] == '\n')
-                                {
-                                    var line = pending.ToString().TrimEnd('\r');
-                                    pending.Clear();
-                                    Receive(line);
-                                }
-                                else
-                                {
-                                    pending.Append(buffer[i]);
-                                    if (pending.Length > 64 * 1024 * 1024)
-                                        throw new FormatException("request frame too large");
-                                }
-                            }
-                        }
+            var reader =
+                new Thread(() =>
+                           {
+                               try
+                               {
+                                   using (var input = new StreamReader(Console.OpenStandardInput(),
+                                                                       new UTF8Encoding(false, true), false, 8192))
+                                   {
+                                       var buffer = new char[8192];
+                                       var pending = new StringBuilder();
+                                       int count;
+                                       while (!stopping && (count = input.Read(buffer, 0, buffer.Length)) > 0)
+                                       {
+                                           for (int i = 0; i < count; i++)
+                                           {
+                                               if (buffer[i] == '\n')
+                                               {
+                                                   var line = pending.ToString().TrimEnd('\r');
+                                                   pending.Clear();
+                                                   Receive(line);
+                                               }
+                                               else
+                                               {
+                                                   pending.Append(buffer[i]);
+                                                   if (pending.Length > 64 * 1024 * 1024)
+                                                       throw new FormatException("request frame too large");
+                                               }
+                                           }
+                                       }
 
-                        if (pending.Length != 0)
-                            Console.Error.WriteLine("protocol: incomplete final frame");
-                    }
-                }
-                catch (Exception e)
-                {
-                    Console.Error.WriteLine("stdin: " + e.Message);
-                }
-                finally
-                {
-                    Stop();
-                }
-            });
+                                       if (pending.Length != 0)
+                                           Console.Error.WriteLine("protocol: incomplete final frame");
+                                   }
+                               }
+                               catch (Exception e)
+                               {
+                                   Console.Error.WriteLine("stdin: " + e.Message);
+                               }
+                               finally
+                               {
+                                   Stop();
+                               }
+                           });
             reader.IsBackground = true;
             reader.Start();
             try

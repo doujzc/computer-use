@@ -11,6 +11,7 @@ import subprocess
 import sys
 from collections.abc import Iterator
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 from computer_use.json import loads as jsonLoads
@@ -31,7 +32,7 @@ def run(command, args, cwd=None, capture=False):
     return result.stdout.strip() if capture else result
 
 
-def build_mac_os(root=None, *, configuration="debug"):
+def build_mac_os(root=None, *, configuration="release"):
     if sys.platform != "darwin":
         raise RuntimeError("Only the macOS backend is implemented.")
     from .pointer import generate_pointer_assets
@@ -82,11 +83,13 @@ def stage_linux_runtime(root, destination):
         desktop_python,
         [
             "-I", "-S", "-c",
-            "import json, sys, sysconfig\n"
-            "if sys.implementation.name != 'cpython' or sys.version_info < (3, 11):\n"
-            "    sys.exit('Linux driver requires system CPython >= 3.11')\n"
-            "sys.stdout.write(json.dumps([sys.version_info[:2], "
-            "bool(sysconfig.get_config_var('Py_GIL_DISABLED')), sysconfig.get_config_var('SOABI')]))\n",
+            (
+                "import json, sys, sysconfig\n"
+                "if sys.implementation.name != 'cpython' or sys.version_info < (3, 11):\n"
+                "    sys.exit('Linux driver requires system CPython >= 3.11')\n"
+                "sys.stdout.write(json.dumps([sys.version_info[:2], "
+                "bool(sysconfig.get_config_var('Py_GIL_DISABLED')), sysconfig.get_config_var('SOABI')]))\n"
+            ),
         ],
         native,
         True,
@@ -128,22 +131,38 @@ def stage_linux_runtime(root, destination):
 
 
 def bundle_wheel_backend(root: Path, output: Path, platform_tag: str) -> None:
-    """Build the host's driver and copy it into the wheel's resource tree."""
+    """Build the host's driver and record the exact installed payload."""
+    from .backend_artifacts import FORMAT, TARGETS, canonical, host_target, sha256
+
+    target = host_target()
+    if TARGETS[target][2] != platform_tag:
+        raise ValueError(f"Source backend does not match wheel platform {platform_tag}.")
     if sys.platform == "darwin":
         bundle = build_mac_os(root, configuration="release").parents[2]
-        shutil.copytree(bundle, output / bundle.relative_to(root))
+        destination = output / bundle.relative_to(root)
+        shutil.copytree(bundle, destination)
+        paths = [path for path in destination.rglob("*") if path.is_file()]
     elif sys.platform == "win32":
         driver = build_windows(root)
         destination = output / driver.parent.relative_to(root)
         destination.mkdir(parents=True, exist_ok=True)
-        for name in (driver.name, "computer-use-capture.exe", "Interop.NativeUIA.dll"):
-            shutil.copy2(driver.parent / name, destination / name)
+        paths = [
+            Path(shutil.copy2(driver.parent / name, destination / name))
+            for name in (driver.name, "computer-use-capture.exe", "Interop.NativeUIA.dll")
+        ]
     else:
-        stage_linux_runtime(root, output / LINUX_RUNTIME)
-    (output / "backend.json").write_text(
-        json.dumps({"platform": platform_tag, "protocol": NATIVE_PROTOCOL_VERSION}),
-        encoding="utf-8",
-    )
+        destination = output / LINUX_RUNTIME
+        stage_linux_runtime(root, destination)
+        paths = [path for path in destination.rglob("*") if path.is_file()]
+    files = {
+        path.relative_to(output).as_posix(): {
+            "sha256": sha256(path.read_bytes()), "mode": 0o755 if path.stat().st_mode & 0o111 else 0o644,
+        }
+        for path in sorted(paths)
+    }
+    (output / "backend.json").write_bytes(canonical({
+        "format": FORMAT, "target": target, "protocol": NATIVE_PROTOCOL_VERSION, "files": files,
+    }))
 
 
 def build_linux(root=None, *, protocol_version=NATIVE_PROTOCOL_VERSION):
@@ -153,11 +172,17 @@ def build_linux(root=None, *, protocol_version=NATIVE_PROTOCOL_VERSION):
     root = Path(root) if root else repository_root()
     native = root / "os_adapter/linux"
     bundled = (root / "backend.json").is_file()
-    wheel = next((native / ".build").glob("*.whl"), None) if bundled else None
-    if bundled and wheel is None:
-        raise RuntimeError("Bundled Linux backend wheel is missing. Reinstall openjiuwen-computeruse.")
+    wheel = None
+    if bundled:
+        wheels = [
+            path for path in (native / ".build").glob("*.whl")
+            if path.name.startswith(("openjiuwen_computeruse_linux-", "computer_use_linux-"))
+        ]
+        if len(wheels) != 1:
+            raise RuntimeError("Bundled Linux backend wheel is missing or ambiguous. Reinstall openjiuwen-computeruse.")
+        wheel = wheels[0].resolve()
     import_path = str(wheel) if bundled else "src"
-    python = linux_python()
+    python = os.environ.get("COMPUTER_USE_PYTHON") or "/usr/bin/python3"
     check = (
         f"from computer_use_linux.runtime.resources import check_installation; check_installation({protocol_version}"
     )
@@ -218,14 +243,36 @@ def build_linux(root=None, *, protocol_version=NATIVE_PROTOCOL_VERSION):
 
 def build_native(root=None, *, protocol_version=NATIVE_PROTOCOL_VERSION):
     _protocol_version(protocol_version)
-    root = Path(root) if root else repository_root()
-    if sys.platform in ("darwin", "win32") and (root / "backend.json").is_file():
-        return Path(native_driver(root=root)["command"])
-    if sys.platform == "linux" and (root / LINUX_RUNTIME / "__main__.py").is_file():
-        return Path(linux_python())
+    executable = None
+    if root is None and sys.platform == "win32":
+        # Resolve the installed driver's short-path fallback before materializing a runtime copy.
+        executable = Path(native_driver()["command"])
+        root = executable.parents[3]
+    else:
+        root = Path(root) if root else repository_root()
+    backend = root / "backend.json"
+    if backend.is_file():
+        from .backend_artifacts import TARGETS, host_target
+
+        metadata = jsonLoads(backend.read_text(encoding="utf-8"))
+        if "format" in metadata or "files" in metadata:
+            matches = metadata["target"] == host_target() and metadata["protocol"] == protocol_version
+        else:
+            # Source wheels built before the unified manifest recorded only a platform and protocol.
+            matches = metadata.get("protocol", protocol_version) == protocol_version and (
+                "platform" not in metadata or metadata["platform"] == TARGETS[host_target()][2]
+            )
+        if not matches:
+            raise RuntimeError("Install a backend wheel matching this platform and native protocol.")
+        if sys.platform != "linux":
+            executable = executable or Path(native_driver(root=root)["command"])
+            report(executable)
+            return executable
     if sys.platform == "darwin":
         return build_mac_os(root)
     if sys.platform == "linux":
+        if (root / LINUX_RUNTIME / "__main__.py").is_file():
+            return Path(linux_python())
         return build_linux(root, protocol_version=protocol_version)
     if sys.platform == "win32":
         return build_windows(root)
@@ -268,21 +315,23 @@ def build_windows(root=None):
     sources = sorted((native / "Sources").rglob("*.cs"))
     if not sources:
         raise RuntimeError("Windows backend sources are missing; reinstall the toolkit.")
-    run(
-        compiler,
-        [
-            "/nologo",
-            "/target:exe",
-            "/platform:x64",
-            "/optimize+",
-            "/warnaserror+",
-            f"/out:{output}",
-            *(f"/reference:{framework / name}" for name in references),
-            f"/reference:{interop}",
-            *sources,
-        ],
-        native,
-    )
+    arguments = [
+        "/nologo",
+        "/target:exe",
+        "/platform:x64",
+        "/optimize+",
+        "/warnaserror+",
+        f"/out:{output}",
+        *(f"/reference:{framework / name}" for name in references),
+        f"/reference:{interop}",
+        *sources,
+    ]
+    # Deep checkouts can exceed the Win32 command-line limit once every source
+    # path is expanded. The BOM lets Framework csc read Unicode paths reliably.
+    with TemporaryDirectory(prefix="computer-use-csc-") as folder:
+        response = Path(folder) / "driver.rsp"
+        response.write_text("".join(f'"{argument}"\n' for argument in arguments), encoding="utf-8-sig")
+        run(compiler, [f"@{response}"], native)
     # Compile the WinRT pixel helper against metadata shipped with Windows.
     # UIA objects and the public driver do not depend on WinRT projections.
     metadata = framework.parents[2] / "System32/WinMetadata"
@@ -342,7 +391,7 @@ def read_permissions(request=False, root=None, timeout=None, *, protocol_version
             timeout=timeout,
         )
     except FileNotFoundError:
-        raise RuntimeError("本机后端尚未构建，请先运行 computer-use-setup 或 computer-use-build。") from None
+        raise RuntimeError("本机后端尚未构建，请先运行 computer-use-build，再运行 computer-use-permissions。") from None
     if result.returncode:
         raise RuntimeError(f"权限检查未完成（{result.returncode}）。")
     status = jsonLoads(result.stdout)
@@ -355,6 +404,8 @@ def read_permissions(request=False, root=None, timeout=None, *, protocol_version
 
 def permission_state(status, platform=None):
     platform = platform or sys.platform
+    if platform == "win32" and "ready" in status:
+        return (True, []) if status["ready"] is True else (False, ["interactiveDesktop"])
     missing = [name for name in ("accessibility", "screenCapture", "input") if status.get(name) is not True]
     ready = status["ready"] is True if platform == "linux" and "ready" in status else not missing
     return ready, missing
@@ -362,7 +413,8 @@ def permission_state(status, platform=None):
 
 def permissions(argv=None):
     parser = argparse.ArgumentParser(
-        description="检查目标桌面权限；--request 在 macOS 发起系统授权提示，Linux 仅报告状态。请使用与 MCP 相同的终端或 SSH 会话。"
+        description="检查目标桌面权限；--request 在 macOS 发起系统授权提示，Windows 和 Linux 报告状态。"
+        "请使用与 SDK 相同的终端或宿主连接。"
     )
     parser.add_argument("--request", action="store_true")
     parser.add_argument(
@@ -381,6 +433,11 @@ def permissions(argv=None):
     report(json.dumps(status, ensure_ascii=False, separators=(",", ":")))
     ready, missing = permission_state(status)
     if not ready:
+        if sys.platform == "win32":
+            raise RuntimeError(
+                f"Windows 桌面未就绪（{status.get('desktopState', 'unknown')}）。"
+                "请在目标用户已解锁的桌面启动宿主，并处理正在显示的 Windows 安全提示。"
+            )
         if sys.platform == "linux":
             raise RuntimeError(
                 (
@@ -403,7 +460,7 @@ def permissions(argv=None):
                 f"{', '.join(missing)}"
                 f"。"
                 f"{message}"
-                f"\n权限归属以系统显示的启动程序为准（驱动、终端或 SSH 服务，例如 sshd-keygen-wrapper）；请从与 MCP "
+                f"\n权限归属以系统显示的启动程序为准（驱动、终端或 SSH 服务，例如 sshd-keygen-wrapper）；请从与 SDK "
                 f"相同的终端或 SSH 连接复查。请求命令不会代替你批准授权。"
             )
         )
@@ -420,9 +477,6 @@ def linux_session_launcher(*, directory=None, env=None):
         raise RuntimeError("Run in the target graphical session (DISPLAY or WAYLAND_DISPLAY is required).")
     if not env.get("DBUS_SESSION_BUS_ADDRESS"):
         raise RuntimeError(("Run in the graphical user's desktop terminal; DBUS_SESSION_BUS_ADDRESS is missing."))
-    mode = env.get("COMPUTER_USE_DESKTOP", "exclusive")
-    if mode not in ("shared", "exclusive"):
-        raise ValueError("COMPUTER_USE_DESKTOP must be shared or exclusive.")
     directory = Path(directory) if directory else Path.home() / ".local/bin"
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
 
@@ -448,8 +502,6 @@ def linux_session_launcher(*, directory=None, env=None):
     )
     values.update(
         XDG_SESSION_TYPE="wayland" if wayland else "x11",
-        COMPUTER_USE_DESKTOP=mode,
-        COMPUTER_USE_FOREGROUND_ASSIST="1" if env.get("COMPUTER_USE_FOREGROUND_ASSIST") == "1" else "0",
     )
     command = " ".join(f"{key}={shlex.quote(value)}" for key, value in values.items())
     output = directory / "computer-use-mcp"
@@ -461,7 +513,7 @@ def linux_session_launcher(*, directory=None, env=None):
         + command
         + " "
         + shlex.quote(sys.executable)
-        + " -m computer_use_mcp\n",
+        + ' -m computer_use_mcp "$@"\n',
         encoding="utf-8",
     )
     output.chmod(0o700)
@@ -470,8 +522,6 @@ def linux_session_launcher(*, directory=None, env=None):
             f"Saved "
             f"{output}"
             f" ("
-            f"{mode}"
-            f"; "
             f"{'Wayland native accessibility; capture/input limited' if wayland else 'X11'}"
             f"). Regenerate after logging out or changing the desktop session."
         )

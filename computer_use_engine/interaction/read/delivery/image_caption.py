@@ -7,24 +7,21 @@ from typing import TYPE_CHECKING
 
 from computer_use.interaction.read.presentation.formatting import json_string, number_string
 
+IMAGE_COORDINATE_SPACE = (
+    "Coordinate space: displayed image pixels. Origin: top-left; x increases right; y increases down."
+)
+IMAGE_POINT_GUIDANCE = "Use (x, y) as shown. The SDK handles resizing and screen/window offsets."
+
 if TYPE_CHECKING:
     from typing import Any, Mapping
 
 
 def png_summary(width: int, height: int, image_bytes: int) -> str:
-    return (
-        f"PNG image ("
-        f"{number_string(width)}"
-        f"x"
-        f"{number_string(height)}"
-        f" px; "
-        f"{number_string(image_bytes)}"
-        f" bytes; use print_image(...) to display)"
-    )
+    return f"PNG image ({number_string(width)}x{number_string(height)} px; {number_string(image_bytes)} bytes)"
 
 
 def window_state_notes(metadata: Mapping[str, Any] | None) -> tuple[str, ...]:
-    "Sample facts and conditional guidance; never a pixel freshness verdict."
+    "Window state sampled during capture."
     state = metadata.get("windowState") if metadata is not None else None
     if state is None:
         return ()
@@ -32,29 +29,21 @@ def window_state_notes(metadata: Mapping[str, Any] | None) -> tuple[str, ...]:
     def label(value: Any) -> str:
         return "unknown" if value is None else ("true" if value else "false")
 
-    notes = [
+    return (
         f"Window state (independent samples during capture): "
-        f"onScreen={label(state['onScreen'])}; ownerForeground={label(state['ownerForeground'])}. "
-        "These independent samples do not measure occlusion or repaint."
-    ]
-    if state["onScreen"] is False or state["ownerForeground"] is False:
-        notes.append(
-            "Off-screen or background window pixels may lag accessibility. Capture time is not draw time; "
-            "do not replay input based only on old pixels."
-        )
-    return tuple(notes)
+        f"onScreen={label(state['onScreen'])}; ownerForeground={label(state['ownerForeground'])}.",
+    )
 
 
 def window_state_summary(metadata: Mapping[str, Any] | None) -> tuple[str, ...]:
-    notes = window_state_notes(metadata)
-    return notes[:1] + (
-        ("Off-screen window or background owner; pixels may lag accessibility.",) if len(notes) > 1 else ()
-    )
+    return window_state_notes(metadata)
 
 
 def render_image_caption(width: int, height: int, facts: Mapping[str, Any]) -> str:
     return (
         _base_caption(width, height, facts)
+        + ("\nCapture: " + json_string(facts["capture"]) if facts.get("capture") else "")
+        + "".join("\n" + note for note in facts.get("captureState", ()))
         + "".join("\nImage note: " + json_string(reason) for reason in facts.get("stopReasons", ()))
         + _visual_text(facts.get("visualText"))
     )
@@ -68,15 +57,14 @@ def _visual_text(visual: Mapping[str, Any] | None) -> str:
         return "\nVisual text (Windows OCR): unavailable. " + visual.get("reason", "")
     lines = [
         "\nVisual text (Windows OCR, " + str(visual["language"]) + "): recognized text and image-pixel rectangles "
-        "(x, y, width, height). These are visual hints, not UIA elements or proof of clickability; "
-        "recognition may be wrong."
+        "(x, y, width, height)."
     ]
     lines.extend(
         "\t" + json_string(line["text"]) + " " + str(tuple(line["rect"][k] for k in ("x", "y", "width", "height")))
         for line in visual["lines"]
     )
     if visual["truncated"] or visual["status"] == "partial":
-        lines.append("Visual text is truncated; the image may contain other text.")
+        lines.append("Visual text coverage: partial.")
     return "\n".join(lines)
 
 
@@ -89,25 +77,32 @@ def _base_caption(width: int, height: int, facts: Mapping[str, Any]) -> str:
     size = number_string(width) + "x" + number_string(height)
     kind = facts["kind"]
     if kind == "unknown":
-        return f"Image: {size} px; source unknown; do not infer App.click coordinates."
+        return f"Image: {size} px; source unknown; coordinate mapping=unavailable.\n" + IMAGE_COORDINATE_SPACE
     if kind == "desktop":
-        return f"Image: desktop {size} px; not valid for App.click coordinates." + (
-            " This image is stale; read the desktop again."
-            if facts.get("stale")
-            else " Origin=top-left; use its display layout and window catalogue."
+        return (
+            f"Image: desktop {size} px; origin=top-left\n"
+            + IMAGE_COORDINATE_SPACE
+            + ("\nCoordinate mapping: stale." if facts.get("stale") else "")
         )
     if kind == "overview":
         return (
-            f"Image: app overview {size} px; context only, not App.click coordinates; use app.window(ref).read().\n"
-        ) + (facts.get("context") or "")
+            f"Image: app overview {size} px; coordinate mapping=unavailable.\n"
+            + IMAGE_COORDINATE_SPACE
+            + "\n"
+            + (facts.get("context") or "")
+        )
     validity = (
-        ("This image is stale; read this App and return its current screenshot before using coordinates.")
+        "\nCoordinate mapping: stale."
         if facts.get("stale")
-        else "Window PNG coordinates; printing does not refresh."
+        else "\nCoordinate mapping: unavailable."
+        if not facts.get("mappingAvailable", True)
+        else ""
     )
     return (
         f"Image: window {size} px; origin=top-left\n{facts['identity']}"
         + ("" if facts.get("omitContext") else "\n" + facts["context"])
         + "\n"
+        + IMAGE_COORDINATE_SPACE
         + validity
+        + (" Coordinate target=" + facts["coordinateTarget"] + "." if facts.get("coordinateTarget") else "")
     )

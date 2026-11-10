@@ -8,13 +8,23 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from typing import Any
 
+from computer_use.interaction.read.facts.decisions import decision_fields
+from computer_use.interaction.read.facts.documents import document_projection
 from computer_use.interaction.read.facts.groups import render_properties
 from computer_use.interaction.read.facts.index import data, field_name, observation_index
-from computer_use.interaction.read.facts.snapshot import SemanticSnapshot
+from computer_use.interaction.read.facts.snapshot import SemanticSnapshot, _seal_projection_sources
+from computer_use.interaction.read.facts.states import (
+    PUBLIC_STATES,
+    READ_ONLY_FIELDS,
+    error_relation,
+    supplement_states,
+)
+from computer_use.interaction.read.facts.values import numeric_aliases
 from computer_use.interaction.read.presentation.fallback import literal
 from computer_use.interaction.read.presentation.records import ReferenceAllocator
-from computer_use.protocol.observation import NativeNode, NativeObservation
+from computer_use.protocol.observation import FieldPath, NativeNode, NativeObservation
 from computer_use.protocol.primitives import required_item, safe_integer
+from computer_use.protocol.records import FactCollection, relation_end
 
 _ROLES = {
     "checkbox": "checkBox",
@@ -30,6 +40,8 @@ _ROLES = {
 }
 _FIELDS = {
     "role_description": "roleDescription",
+    "control_value.description": "valueDescription",
+    "numeric_value.description": "rangeDescription",
     "text.selected_text": "selectedText",
     "states.checked": "toggleState",
     "structure.heading_level": "headingLevel",
@@ -50,6 +62,22 @@ _VALUE_FIELDS = {
 }
 _STRUCTURAL_FIELDS = {"text.source", "text.unit", "text.content_field"}
 _ISSUES_PRESERVING_CONTENT = {"partial", "error", "timeout", "unavailable", "redacted", "stale", "conflict"}
+_CHILD_CONTENT_ROLES = frozenset(
+    (
+        "window",
+        "dialog",
+        "alert",
+        "sheet",
+        "popover",
+        "browser",
+        "scroll_area",
+        "web_area",
+        "document",
+        "list",
+        "table",
+        "tree",
+    )
+)
 
 
 def presentation_role(role: str | None) -> str:
@@ -63,9 +91,9 @@ def _value_text(value: Any, aliases: dict[str, str]) -> str:
     """Format a public scalar while preserving element-valued identity."""
     if isinstance(value, str):
         return value
-    if isinstance(value, dict) and set(value) == {"element"}:
+    if isinstance(value, Mapping) and set(value) == {"element"}:
         return "element " + aliases[value["element"]]
-    if isinstance(value, dict) and set(value) in ({"datetime"}, {"number"}):
+    if isinstance(value, Mapping) and set(value) in ({"datetime"}, {"number"}):
         return next(iter(value.values()))
     return literal(value)
 
@@ -79,6 +107,33 @@ def _primary_value(source: dict[str, Any], node: NativeNode) -> str | None:
     return next((key for key in ("control_value.value", text_source, "numeric_value.value") if key in values), None)
 
 
+def _disclosure_fields(source: dict[str, Any], role: str | None) -> frozenset[str]:
+    """Identify complete, agreeing outline disclosure reports and their source fields.
+
+    The normalized ``disclosing`` supplement reports outline-row disclosure state.
+    Keep it independent of ``states.expanded`` so contradictory native reports can
+    both be displayed. Unknown types, duplicate conflicts, and read gaps retain their
+    original supplementary representation.
+    """
+    if role not in ("row", "tree_item"):
+        return frozenset()
+    values = {
+        key: item.get("value")
+        for key, item in source["values"].items()
+        if key.startswith("supplements[") and item["key"] == "disclosing"
+    }
+    if not values or any(value is not True and value is not False for value in values.values()):
+        return frozenset()
+    if len(set(values.values())) != 1:
+        return frozenset()
+    paths = [source["fieldPaths"][key] for key in values]
+    for key in source["fieldStatus"]:
+        status_path = source["fieldPaths"][key]
+        if any(path[: len(status_path)] == status_path or status_path[: len(path)] == path for path in paths):
+            return frozenset()
+    return frozenset(values)
+
+
 def normalize_facts(
     value: NativeObservation,
     references: ReferenceAllocator,
@@ -86,19 +141,61 @@ def normalize_facts(
     driver_features: Iterable[str] = (),
     scope_kind: str | None = None,
     operation_capabilities: Mapping[str, Mapping[str, str]] | None = None,
+    diagnostic_fields: Mapping[str, Iterable[FieldPath]] | None = None,
+    field_sources: Mapping[tuple[str, FieldPath], str] | None = None,
 ) -> SemanticSnapshot:
     """Organize a unified fact graph into source-accounted presentation roots.
 
     Preserve independent values, relationship views, collection gaps and native
     identities. Platform interpretation is completed before this entry point.
     """
-    if scope_kind not in (None, "window", "applicationMenu"):
+    if scope_kind not in (None, "window", "applicationMenu", "applicationContent"):
         raise ValueError("Unknown observation scope kind")
     if not isinstance(value, NativeObservation):
         raise TypeError("normalizeFacts requires a normalized NativeObservation")
     if references.session != value.session:
         raise ValueError("Native display references belong to another session")
-    batch = observation_index(value)
+    return _project_facts(
+        value,
+        observation_index(value),
+        references,
+        driver_features,
+        scope_kind,
+        operation_capabilities,
+        diagnostic_fields,
+        field_sources,
+    )
+
+
+def renumber_snapshot(snapshot: SemanticSnapshot, references: ReferenceAllocator) -> SemanticSnapshot:
+    """Apply aliases to the display view without rebuilding its source fact index."""
+    if references.session != snapshot.native.session:
+        raise ValueError("Native display references belong to another session")
+    projected = _project_facts(
+        snapshot.native,
+        snapshot.facts,
+        references,
+        snapshot.driver_features,
+        snapshot.scope_kind,
+        snapshot.collection.operation_capabilities if snapshot.collection is not None else None,
+        snapshot.collection.diagnostic_fields if snapshot.collection is not None else None,
+        snapshot.collection.field_sources if snapshot.collection is not None else None,
+    )
+    projected.collection = snapshot.collection
+    return projected
+
+
+def _project_facts(
+    value: NativeObservation,
+    batch: FactCollection,
+    references: ReferenceAllocator,
+    driver_features: Iterable[str],
+    scope_kind: str | None,
+    operation_capabilities: Mapping[str, Mapping[str, str]] | None,
+    diagnostic_fields: Mapping[str, Iterable[FieldPath]] | None,
+    field_sources: Mapping[tuple[str, FieldPath], str] | None,
+) -> SemanticSnapshot:
+    """Build an alias-dependent display view over one acquired source index."""
     ordered_tokens = [source["node"] for source in batch["nodes"] if source["observed"]]
     observed_tokens = set(ordered_tokens)
     ordered_tokens.extend(token for token in value.nodes if token not in observed_tokens)
@@ -106,9 +203,11 @@ def normalize_facts(
     aliases = {token: ref for ref, token in refs.items()}
     nodes, sources, text_refs, value_fields, grouped = {}, {}, {}, {}, {}
     annotations = []
+    supplement_annotations = {}
 
     for source in batch["nodes"]:
         token, raw = source["node"], source["values"]
+        diagnostics = frozenset((diagnostic_fields or {}).get(token, ()))
         original, ref = value.nodes[token], aliases[token]
         if not source["observed"] and token not in value.roots:
             for key, status in source["fieldStatus"].items():
@@ -131,8 +230,15 @@ def normalize_facts(
             node["subrole"] = original.role
         nodes[token] = node
         primary = _primary_value(source, original)
+        disclosure_fields = _disclosure_fields(source, original.role)
+        document = document_projection(source, original.supplements)
+        states = supplement_states(source)
+        decisions = decision_fields(source)
         if primary is not None:
             value_fields[ref] = primary
+        aliases_of_value = numeric_aliases(source, primary, field_sources or {})
+        if aliases_of_value:
+            node["_numericValueAliases"] = [_VALUE_FIELDS[name] for name in aliases_of_value]
         for key, item in raw.items():
             field = None
             if key == "role":
@@ -152,10 +258,28 @@ def normalize_facts(
                     "selectedChildCount",
                 ) or safe_integer(item):
                     field = candidate
+            elif key in READ_ONLY_FIELDS and key not in source["fieldStatus"]:
+                field = READ_ONLY_FIELDS[key]
+            elif key in decisions:
+                field, item = decisions[key]
+                if field == "rangeAllowedValues":
+                    item = tuple(
+                        {"element": aliases[value["element"]]}
+                        if isinstance(value, Mapping) and set(value) == {"element"}
+                        else value
+                        for value in item
+                    )
+                node["preserveGroup"] = True
+            elif key in states:
+                field, item = states[key]
             elif key.startswith("states.") and key[7:] in _DISPLAY_STATES:
                 field = key[7:]
             elif key == "states.expanded" and item in ("expanded", "collapsed"):
                 field, item = "expanded", item == "expanded"
+            elif key in disclosure_fields:
+                field, item = "disclosing", item["value"]
+            elif document is not None and key in document.sources:
+                field, item = document.field, document.value
             elif key in _VALUE_FIELDS:
                 field = "value" if key == primary else _VALUE_FIELDS[key]
                 item = _value_text(item, aliases)
@@ -176,8 +300,11 @@ def normalize_facts(
                     representation="field",
                     normalized=node[field],
                 )
+                if field in PUBLIC_STATES and item is not False:
+                    node["preserveGroup"] = True
             else:
                 structural = key in _STRUCTURAL_FIELDS
+                supplement = key.startswith("supplements[")
                 sources[(ref, key)] = dict(
                     node=token,
                     path=source["fieldPaths"][key],
@@ -185,14 +312,23 @@ def normalize_facts(
                     representation="raw" if structural else "annotation",
                 )
                 if not structural:
-                    grouped.setdefault((key, literal(item)), []).append(ref)
-                provider_fact = key.startswith("supplements[") and item["key"].startswith("provider.")
-                meaningful_extra = (
-                    key.startswith("supplements[")
-                    and item["key"] in ("item_status", "item_type")
-                    and bool(item["value"])
+                    if supplement:
+                        # The immutable fact rows own these values throughout projection.
+                        # Reuse the formatted value, keeping each field's own annotation.
+                        identity = id(item)
+                        label = supplement_annotations.get(identity)
+                        if label is None:
+                            supplement_annotations[identity] = label = literal(item)
+                    else:
+                        label = literal(item)
+                    grouped.setdefault((key, label), []).append(ref)
+                provider_fact = (
+                    supplement and item["key"].startswith("provider.") and source["fieldPaths"][key] not in diagnostics
                 )
-                invalid_geometry = key.startswith("geometry.") and isinstance(item, dict) and item.get("valid") is False
+                meaningful_extra = supplement and item["key"] in ("item_status", "item_type") and bool(item["value"])
+                invalid_geometry = (
+                    key.startswith("geometry.") and isinstance(item, Mapping) and item.get("valid") is False
+                )
                 matches_provider_fact = (
                     True
                     if (
@@ -308,6 +444,14 @@ def normalize_facts(
         complete = relation["state"] == "complete"
         confirmed = relation["certainty"] == "confirmed"
         if relation["state"] in ("absent", "unsupported"):
+            # Unsupported children are normal on leaves, but do not establish
+            # that a content region is empty. Preserve this local gap unless a
+            # separately reported children view already accounts for coverage.
+            unsupported_children = kind == "children" and relation["state"] == "unsupported"
+            if unsupported_children and value.nodes[token].role in _CHILD_CONTENT_ROLES and not child_views.get(token):
+                source["partialReason"] = "child enumeration unsupported; contents unknown"
+                source["childEnumerationUnsupported"] = True
+                source["preserveGroup"] = True
             extra_edges.append(relation)
             continue
         if kind == "children" and confirmed:
@@ -321,12 +465,18 @@ def normalize_facts(
                 if "total" in relation:
                     source["childCount"] = relation["total"]
                 if "offset" in relation:
-                    source.update(childrenStart=relation["offset"], childrenEnd=relation["offset"] + len(targets))
+                    source.update(childrenStart=relation["offset"], childrenEnd=relation_end(relation))
                     if "cursor" in relation:
                         source["nextChildOffset"] = source["childrenEnd"]
+                if "unavailablePositions" in relation:
+                    source["childrenRead"] = len(targets)
                 source["partialReason"] = "observed children partly collected; see Relation details"
             if any(target in batch["unread"] for target in targets):
                 source["partialReason"] = "child facts have not been collected"
+        elif kind == "error":
+            source.setdefault("errorRelations", []).append(error_relation(relation, aliases))
+            source["preserveGroup"] = True
+            extra_edges.append(relation)
         else:
             matches_confirmed_condition = (
                 True
@@ -409,16 +559,18 @@ def normalize_facts(
     annotations.extend("Collection: " + literal(reason) for reason in batch["stopReasons"])
     if value.coordinate_spaces:
         annotations.append("Coordinate spaces: " + literal(data(value.coordinate_spaces)))
-    return SemanticSnapshot(
-        value,
-        batch,
-        roots,
-        refs,
-        annotations,
-        sources,
-        text_refs,
-        scope_kind,
-        root_contexts,
-        value_fields,
-        frozenset(driver_features),
+    return _seal_projection_sources(
+        SemanticSnapshot(
+            value,
+            batch,
+            roots,
+            refs,
+            annotations,
+            sources,
+            text_refs,
+            scope_kind,
+            root_contexts,
+            value_fields,
+            frozenset(driver_features),
+        )
     )

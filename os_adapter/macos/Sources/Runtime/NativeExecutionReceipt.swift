@@ -12,16 +12,19 @@ import Foundation
     var retryReason: String?
     var context: [String: Any]?
     var application: [String: Any]?
+    var impact: [String: Any]?
+    var appChangeInputBaseline: NativeAppObserver.Stamp?
     private(set) var errorCode: FailureCode?
     private(set) var acceptedCount = 0
     private(set) var preparation = [String]()
+    private(set) var nonRepeatablePreparation = false
     private(set) var cleanup = "complete"
     private var clipboard: String?
     private let onEffect: () -> Void
     var click: NativeClickEvidence?
 
     init(
-        target: [String: Any], detail: String = "Native action dispatched; application effect unconfirmed.",
+        target: [String: Any], detail: String = "Native action dispatched.",
         confirmation: String = "unavailable", onEffect: @escaping () -> Void
     ) {
         self.target = target
@@ -34,10 +37,15 @@ import Foundation
         preparation.append(change)
         onEffect()
     }
+    func recordNonRepeatablePreparation(_ change: String) {
+        nonRepeatablePreparation = true
+        recordPreparation(change)
+    }
     func recordAccepted() { acceptedCount += 1 }
     func recordCleanupUnknown() { cleanup = "unknown" }
 
     func recordClipboardRestore(_ outcome: PasteboardTransaction.RestoreResult) {
+        NativeInputActivity.current?.recordClipboardRestoration(outcome)
         switch outcome {
         case .restored: clipboard = "Original clipboard contents restored."
         case .ownershipLost: clipboard = "A later or unconfirmed clipboard owner was preserved."
@@ -58,7 +66,9 @@ import Foundation
         errorCode = (cause as? ClassifiedFailure)?.code ?? .executionFailed
         detail = String(describing: cause)
         confirmation = "notRequested"
-        if acceptedCount > 0 { dispatch = "partial" }
+        // A later restoration/cleanup failure cannot undo completed input.
+        // An interrupted sequence still retains its accepted prefix.
+        if acceptedCount > 0, dispatch != "dispatched" { dispatch = "partial" }
     }
 
     var succeeded: Bool { errorCode == nil && cleanup == "complete" }
@@ -71,6 +81,8 @@ import Foundation
             "context": context as Any? ?? NSNull()
         ]
         if let application { value["application"] = application }
+        if let impact { value["impact"] = impact }
+        if let appChangeInputBaseline { value["appChangeInputBaseline"] = appChangeInputBaseline.wire }
         if let click { value["click"] = click.wire }
         return value
     }

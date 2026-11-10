@@ -19,41 +19,64 @@ import ApplicationServices
 
     func inputTarget(_ ref: String) throws -> Target {
         guard let target = registry.target(ref) else {
-            throw DriverError("element reference expired; read the app again", code: .staleTarget)
+            throw DriverError("element reference expired", code: .staleTarget)
         }
         guard target.application.launchDate == target.launched else {
-            throw DriverError("target process changed; read the app again", code: .staleTarget)
+            throw DriverError("target process changed", code: .staleTarget)
         }
         try BackgroundTarget(target.application).validate(input: true)
         guard AXIsProcessTrusted() else {
             throw DriverError("accessibility permission denied", code: .desktopUnavailable)
         }
         try inspection.validateTargetIdentity(target)
-        // Read the current native role/subrole, not an old capability flag.
-        // Reject before window preparation, AX focus, mouse or key dispatch.
-        try validateSharedElementInput(target)
         return target
-    }
-
-    func validateSharedElementInput(_ target: Target) throws {
-        guard !BackgroundTarget.isExclusive else { return }
-        try SharedDesktopPolicy.validateElementInput(
-            role: target.role, subrole: target.identity.attributes[kAXSubroleAttribute],
-            currentRole: inspection.attribute(target.element, kAXRoleAttribute) as? String,
-            currentSubrole: inspection.attribute(target.element, kAXSubroleAttribute) as? String, exclusive: false)
     }
 
     func declaredActions(_ element: AXUIElement) throws -> [NativeAction.Item]? {
         try RequestDiagnostics.checkCancellation()
         var raw: CFArray?
-        guard AXUIElementCopyActionNames(element, &raw) == .success, let rawNames = raw as? [String],
-            let names = NativeAction.boundedNames(rawNames)
-        else { return nil }
-        return try names.map { name in
+        guard AXUIElementCopyActionNames(element, &raw) == .success, let rawNames = raw as? [String] else {
+            return nil
+        }
+        return try NativeAction.catalogue(rawNames) { name in
             try RequestDiagnostics.checkCancellation()
             var description: CFString?
             AXUIElementCopyActionDescription(element, name as CFString, &description)
-            return NativeAction.Item(name: name, description: description as String?)
+            return description as String?
+        }
+    }
+
+    /// An explicit name needs only its own declaration. Localized aliases
+    /// additionally need a complete, bounded description catalogue.
+    func explicitAction(_ element: AXUIElement, request: String) throws -> NativeAction.Item? {
+        try RequestDiagnostics.checkCancellation()
+        var raw: CFArray?
+        let status = AXUIElementCopyActionNames(element, &raw)
+        let names = status == .success ? raw as? [String] : nil
+        let resolved = try NativeAction.resolveExplicit(
+            request: request, names: names,
+            description: { name in
+                var description: CFString?
+                let status = AXUIElementCopyActionDescription(element, name as CFString, &description)
+                try RequestDiagnostics.checkCancellation()
+                return status == .success ? description as String? : nil
+            }, check: RequestDiagnostics.checkCancellation)
+        try RequestDiagnostics.checkCancellation()
+        switch resolved {
+        case .selected(let action): return action
+        case .absent: return nil
+        case .ambiguous:
+            throw DriverError("the explicit native action is ambiguous; no requested action sent", code: .ambiguousTarget)
+        case .namesUnavailable:
+            throw DriverError("native action names are unavailable; no requested action sent", code: .observationIncomplete)
+        case .descriptionsUnavailable:
+            throw DriverError(
+                "localized action descriptions are incomplete; a unique alias cannot be confirmed",
+                code: .observationIncomplete)
+        case .descriptionBudgetExceeded:
+            throw DriverError(
+                "localized action alias exceeds the description budget; use the exact native action name",
+                code: .observationIncomplete)
         }
     }
 }

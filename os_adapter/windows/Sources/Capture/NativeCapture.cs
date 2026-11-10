@@ -16,12 +16,11 @@ namespace ComputerUse.Windows
     {
         readonly NativeReadStore store;
         readonly NativePointerCaptures captures;
-        readonly string desktopScope, mode;
-        internal NativeCapture(NativeReadStore store, string session, string mode, NativePointerCaptures captures = null)
+        readonly string desktopScope;
+        internal NativeCapture(NativeReadStore store, string session, NativePointerCaptures captures = null)
         {
             this.store = store;
             desktopScope = session + ":desktop";
-            this.mode = mode;
             this.captures = captures;
         }
 
@@ -61,6 +60,26 @@ namespace ComputerUse.Windows
             return Wire.Obj("id", NativeReadStore.Token("capture"), "kind", kind, "scope", scope, "startedAt", Math.Floor(start), "completedAt", Math.Ceiling(Wire.Now), "width", geometry.Width, "height", geometry.Height, "png", png);
         }
 
+        internal static Dictionary<string, object> DesktopWindowRow(NativeWindowRecord item, string title,
+                                                                    object rectangle, bool hasOwner,
+                                                                    NativeWindowRecord owner)
+        {
+            var window = item.Native;
+            title = NativeReadStore.Text(title);
+            var surface = Wire.Obj("window", window.Ref, "instance", window.Selector, "surface", window.Scope,
+                                   "node", null, "title", title, "kind", "window",
+                                   "parent", owner == null ? null : owner.Native.Ref,
+                                   "parentState", owner != null ? "known" : hasOwner ? "unknown" : "none",
+                                   "modal", null, "nativeWindow", true, "accessibility", false);
+            return Wire.Obj("app", NativeReadStore.Text(item.DisplayName), "title", title, "selector", item.Application,
+                            "rect", rectangle, "window", surface);
+        }
+
+        internal static Dictionary<string, object> DesktopForegroundRow(NativeWindowRecord item)
+        {
+            return Wire.Obj("name", NativeReadStore.Text(item.DisplayName), "selector", item.Application);
+        }
+
         public object Capture(Dictionary<string, object> target, string kind, int maxDimension, Request r)
         {
             Check(r);
@@ -73,6 +92,9 @@ namespace ComputerUse.Windows
                 if (selected == null || target["node"] != null || target["capture"] != null)
                     throw new Failure("invalid_request", "window capture requires a window read binding");
                 Window window = selected.Native;
+                if (!Native.IsWindowVisible(window.Handle) || Native.IsIconic(window.Handle))
+                    throw new Failure("observation_unavailable", "the selected window is hidden or minimized",
+                                      "show the same window, or read it with allow_foreground=True if minimized");
                 var layout = captures == null ? null : new NativePointerLayout();
                 Rectangle physical = Native.Bounds(window.Handle);
                 var windowPixels = NativeWindowPixels.Read(window, maxDimension, r);
@@ -81,7 +103,7 @@ namespace ComputerUse.Windows
                 store.Validate(target, r);
                 Check(r);
                 if (Native.Bounds(window.Handle) != physical || Native.IsIconic(window.Handle))
-                    throw new Failure("stale_target", "window geometry changed during capture; read again");
+                    throw new Failure("stale_target", "window geometry changed during capture");
                 var windowImage = Image(kind, (string)target["surface"], start, geometry, png);
                 if (windowPixels.VisualText != null)
                     windowImage["visualText"] = windowPixels.VisualText;
@@ -90,7 +112,7 @@ namespace ComputerUse.Windows
                 if (captures != null)
                 {
                     if (new NativePointerLayout().Signature != layout.Signature)
-                        throw new Failure("stale_target", "display layout changed during window capture; read again");
+                        throw new Failure("stale_target", "display layout changed during window capture");
                     captures.Add((string)windowImage["id"], target, geometry, layout.Canvas, layout.Signature, layout.Displays, new NativeCaptureGeometry(physical.X, physical.Y, physical.Width, physical.Height, maxDimension));
                 }
 
@@ -107,14 +129,17 @@ namespace ComputerUse.Windows
                 throw new Failure("observation_unavailable", "display catalogue is incomplete or exceeds the protocol budget");
             string pixels = DesktopPixels(canvas, shape, r);
             if (SystemInformation.VirtualScreen != canvas || !displaysBefore.Select(s => s.Name + ":" + s.Bounds).SequenceEqual(Screen.AllScreens.Select(s => s.DeviceName + ":" + s.Bounds)))
-                throw new Failure("stale_target", "display geometry changed during capture; read again");
+                throw new Failure("stale_target", "display geometry changed during capture");
             var notes = new List<string>();
             var windows = new List<object>();
             object frontmost = null;
             try
             {
                 IntPtr front = Native.GetForegroundWindow();
-                foreach (var item in store.Catalog(r, notes))
+                var catalogue = store.Catalog(r, notes,
+                    captureDeadline: Math.Min(r.Deadline, start + Request.ObservationMs)).Windows;
+                var byHandle = catalogue.ToDictionary(entry => entry.Native.Handle);
+                foreach (var item in catalogue)
                 {
                     r.Check();
                     try
@@ -127,9 +152,13 @@ namespace ComputerUse.Windows
                         var rect = shape.Clip(bounds.X, bounds.Y, bounds.Width, bounds.Height);
                         if (rect == null)
                             continue;
-                        windows.Add(Wire.Obj("app", NativeReadStore.Text(window.Name), "title", NativeReadStore.Text(Native.Title(window.Handle)), "selector", window.Selector, "rect", rect));
+                        var ownerHandle = Native.GetWindow(window.Handle, 4);
+                        NativeWindowRecord owner;
+                        byHandle.TryGetValue(ownerHandle, out owner);
+                        windows.Add(DesktopWindowRow(item, Native.Title(window.Handle), rect,
+                                                     ownerHandle != IntPtr.Zero, owner));
                         if (window.Handle == front)
-                            frontmost = Wire.Obj("name", NativeReadStore.Text(window.Name), "selector", window.Selector);
+                            frontmost = DesktopForegroundRow(item);
                     }
                     catch (Failure error)
                     {
@@ -158,7 +187,7 @@ namespace ComputerUse.Windows
 
             Check(r);
             var displays = displaysBefore.Select(s => Wire.Obj("name", s.Name, "rect", shape.Clip(s.Bounds.X, s.Bounds.Y, s.Bounds.Width, s.Bounds.Height), "captured", true)).ToArray();
-            var observation = Wire.Obj("mode", mode, "canvas", Wire.Obj("width", shape.Width, "height", shape.Height), "frontmost", frontmost, "displays", displays, "windows", windows.Take(256).ToArray(), "omittedWindows", Math.Max(0, windows.Count - 256));
+            var observation = Wire.Obj("canvas", Wire.Obj("width", shape.Width, "height", shape.Height), "frontmost", frontmost, "displays", displays, "windows", windows.Take(256).ToArray(), "omittedWindows", Math.Max(0, windows.Count - 256));
             if (notes.Count > 0)
                 observation["catalogError"] = NativeReadStore.Text(String.Join("\n", notes));
             var image = Image(kind, desktopScope, start, shape, pixels);
@@ -166,7 +195,7 @@ namespace ComputerUse.Windows
             {
                 var layout = new NativePointerLayout();
                 if (layout.Signature != desktopLayout.Signature || layout.Canvas.X != canvas.X || layout.Canvas.Y != canvas.Y || layout.Canvas.NativeWidth != canvas.Width || layout.Canvas.NativeHeight != canvas.Height || !displaysBefore.Select(s => s.Name + ":" + s.Bounds).SequenceEqual(Screen.AllScreens.Select(s => s.DeviceName + ":" + s.Bounds)))
-                    throw new Failure("stale_target", "display geometry changed during capture; read again");
+                    throw new Failure("stale_target", "display geometry changed during capture");
                 captures.Add((string)image["id"], target, shape, layout.Canvas, layout.Signature, layout.Displays);
             }
 

@@ -8,7 +8,7 @@ import logging
 import time
 from uuid import uuid4
 
-from computer_use_mcp.server import DESCRIPTION, RESET_DESCRIPTION
+from computer_use_mcp.instructions import CODE_DESCRIPTION, DESCRIPTION, RESET_DESCRIPTION, TITLE_DESCRIPTION
 from openjiuwen.core.foundation.tool import Tool, ToolCard
 from openjiuwen.core.foundation.tool.base import render_payload_text
 from openjiuwen.core.foundation.tool.mcp.base import extract_mcp_tool_result_content
@@ -37,8 +37,8 @@ logger = logging.getLogger(__name__)
 ROUTE_TASK_DESCRIPTION = """Rank every known way to accomplish a task — registered app API routes, shell CLI
 routes, and direct GUI operation — by learned success rate, expected time and cost, then act on the best
 eligible path. Call this before manipulating the UI when the task might be achievable through an API or shell
-route. It executes the chosen path itself when the decision is execute, and reports the outcome. If the
-decision is gui_fallback, continue with computer_use. If the decision is refuse, explain the reason and ask
+route. It executes the chosen registered path itself and reports the outcome. If it chooses gui://fallback,
+no GUI task has been executed; continue with computer_use. If the decision is refuse, explain the reason and ask
 the user instead of forcing operations. Pass subtasks to split the task into independently routed subtasks.
 Never retry a route whose effect is unknown."""
 
@@ -82,16 +82,15 @@ class ComputerUseToolkit:
         self._closing = None
         self._route_depth = 0
         self.routing = self._build_router()
-        properties = {
-            "title": {"type": "string", "description": "Describe this call's intent in the user's language."},
-            "code": {"type": "string", "description": "Python code with top-level await."},
-        }
         self.tools = [
             DesktopTool(
                 self,
                 name="computer_use",
                 description=DESCRIPTION,
-                properties=properties,
+                properties={
+                    "title": {"type": "string", "description": TITLE_DESCRIPTION},
+                    "code": {"type": "string", "description": CODE_DESCRIPTION},
+                },
                 required=["code"],
             ),
             DesktopTool(self, name="computer_use_reset", description=RESET_DESCRIPTION, properties={}, required=[]),
@@ -186,6 +185,18 @@ class ComputerUseToolkit:
         self.emit("tool_result", {"name": name, "result": raw})
         converted = extract_mcp_tool_result_content(result, include_image_content=True, tool_name=name)
         data = converted.data if hasattr(converted, "data") else {"content": converted or ""}
+        images = [block for block in raw["content"] if block["type"] == "image"]
+        for index, (item, block) in enumerate(zip(data.get("multimodal", ()), images), start=1):
+            metadata = block.get("_meta", {}).get("computer-use", {})
+            identifier = metadata.get("imageId", str(index))
+            caption = metadata.get("caption", "")
+            # The framework renders source_path beside each image, including
+            # images forwarded in a separate multimodal message.
+            label = f"Image {identifier}"
+            after_action = metadata.get("capturedAfterAction")
+            if type(after_action) is int and after_action > 0:
+                label += f"\nCaptured after Action #{after_action}."
+            item["source_path"] = label + (f"\n{caption}" if caption else "")
         data = {**data, "content": render_payload_text(data) or "Execution returned no text."}
         data = {**data, "mcp_result": raw}
         return ToolOutput(success=not result.isError, data=data, error=getattr(converted, "error", None))

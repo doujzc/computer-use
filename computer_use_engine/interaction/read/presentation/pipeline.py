@@ -5,12 +5,18 @@
 
 from __future__ import annotations
 
+from functools import cache
 from typing import TYPE_CHECKING
 
 from computer_use.interaction.read.presentation.accounting.pipeline import AccountingPipeline
-from computer_use.interaction.read.presentation.accounting.relations import RelationPresentation
+from computer_use.interaction.read.presentation.compression.evidence import capture_evidence
 from computer_use.interaction.read.presentation.compression.pipeline import CompressionPipeline
 from computer_use.interaction.read.presentation.fallback import UncompressedFacts, branch_references
+from computer_use.interaction.read.presentation.interface.geometric.presentation.pipeline import (
+    GeometricPresentationPipeline,
+)
+from computer_use.interaction.read.presentation.interface.text.model import InterfaceTextRequest
+from computer_use.interaction.read.presentation.interface.text.pipeline import InterfaceTextPipeline
 from computer_use.interaction.read.presentation.model import (
     PRESENTATION_FAILURES,
     PURE,
@@ -19,9 +25,7 @@ from computer_use.interaction.read.presentation.model import (
     SnapshotParts,
     SnapshotRenderRequest,
 )
-from computer_use.interaction.read.presentation.passes.assemble_rendered_part import (
-    stage as assemble_rendered_part,
-)
+from computer_use.interaction.read.presentation.passes.assemble_rendered_part import stage as assemble_rendered_part
 from computer_use.interaction.read.presentation.preparation import (
     CapturedSnapshot,
     PreparationFailure,
@@ -29,9 +33,10 @@ from computer_use.interaction.read.presentation.preparation import (
     PreparedSnapshot,
     prepare_snapshot,
     prepared_nodes,
-    render_prepared_snapshot,
 )
+from computer_use.interaction.read.presentation.preparation import render_prepared_snapshot
 from computer_use.interaction.read.presentation.rendering.pipeline import RenderPipeline
+from computer_use.interaction.read.presentation.rendering.output import RenderedDocument, RenderedSection
 from computer_use.interaction.read.presentation.semantics.pipeline import SemanticPipeline
 from computer_use.pipeline import Contract, Pipeline, Sequence
 from computer_use.pipeline.core import Node
@@ -46,6 +51,9 @@ __all__ = [
 ]
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable, Iterator
+
+    from computer_use.interaction.read.presentation.compression.evidence import CompressionEvidence
     from computer_use.interaction.read.presentation.ir import ProjectionResult
     from computer_use.interaction.read.presentation.records import RenderedTree, SemanticNode, SnapshotFacts
     from computer_use.pipeline.core import Control, Step
@@ -77,13 +85,30 @@ class PresentationPipeline(Pipeline["SemanticNode", "ProjectionResult"]):
         )
 
 
-def _branch_facts(snapshot: SnapshotFacts, request: SnapshotRenderRequest, root: SemanticNode) -> BranchFacts:
+def _checked(items: Iterable, checkpoint: Callable[[], object] | None) -> Iterator:
+    """Keep root-local indexing and output scans within the original call budget."""
+    if checkpoint is not None:
+        checkpoint()
+    for index, item in enumerate(items, 1):
+        if checkpoint is not None and index % 128 == 0:
+            checkpoint()
+        yield item
+
+
+def _branch_facts(
+    snapshot: SnapshotFacts,
+    request: SnapshotRenderRequest,
+    root: SemanticNode,
+    *,
+    checkpoint: Callable[[], object] | None = None,
+    snapshot_evidence: Callable[[], CompressionEvidence] | None = None,
+) -> BranchFacts:
     """Build the exact source indexes shared by preparation and final accounting."""
-    native_nodes = {node["node"]: node for node in snapshot.facts["nodes"]}
-    relations = RelationPresentation(snapshot.facts, snapshot.refs)
-    members = branch_references(root, snapshot.refs)
+    native_nodes = snapshot.presentation_nodes
+    relations = snapshot.presentation_relations
+    members = branch_references(root, snapshot.refs, checkpoint=checkpoint)
     readable_text = set()
-    for ref in members:
+    for ref in _checked(members, checkpoint):
         key = snapshot.value_fields.get(ref)
         if key is None:
             continue
@@ -92,7 +117,7 @@ def _branch_facts(snapshot: SnapshotFacts, request: SnapshotRenderRequest, root:
             continue
         if key not in source["fieldStatus"] or "textRef" in source["fieldStatus"][key]:
             readable_text.add(ref)
-    return BranchFacts(request, root, members, native_nodes, relations, readable_text)
+    return BranchFacts(request, root, members, native_nodes, relations, readable_text, snapshot_evidence)
 
 
 class _BranchCollection(Node["SnapshotRenderRequest", "PreparedSnapshot"]):
@@ -108,23 +133,49 @@ class _BranchCollection(Node["SnapshotRenderRequest", "PreparedSnapshot"]):
     def _run(self, request: SnapshotRenderRequest, control: Control) -> PreparedSnapshot:
         from dataclasses import replace
 
-        captured = CapturedSnapshot.capture(request.snapshot)
-        snapshot = captured.materialize()
+        captured = CapturedSnapshot.capture(request.snapshot, checkpoint=control.remaining)
+        snapshot = captured.materialize(read_only_sources=True, checkpoint=control.remaining)
         local_request = replace(request, snapshot=snapshot)
+
+        @cache
+        def snapshot_evidence() -> CompressionEvidence:
+            # All roots use the same immutable source graph. Keep failures inside each root's fallback.
+            return capture_evidence(snapshot, snapshot.presentation_nodes)
+
         roots = []
-        for root in snapshot.roots:
+        recovery_prefix = request.recovery_prefix_units
+        for root in _checked(snapshot.roots, control.remaining):
             # Identity and source validation deliberately remain outside the
             # pure display fallback; they must never publish guessed bindings.
-            branch = _branch_facts(snapshot, local_request, root)
+            branch = _branch_facts(
+                snapshot, local_request, root, checkpoint=control.remaining, snapshot_evidence=snapshot_evidence
+            )
             try:
-                projection = PresentationPipeline(branch).run(root, control)
-                prepared = PreparedRoot.capture(root["ref"], branch.members, projection)
+                if request.compact and request.public_api and request.share_descriptions:
+                    source = SemanticPipeline(branch).run(root, control)
+                    prepared = GeometricPresentationPipeline(branch, captured, recovery_prefix).run(source, control)
+                    recovery_prefix = max(
+                        (group.recovery_units for group in _checked(prepared.groups.groups, control.remaining)),
+                        default=recovery_prefix,
+                    )
+                else:
+                    projection = PresentationPipeline(branch).run(root, control)
+                    prepared = PreparedRoot.capture(
+                        root["ref"], branch.members, projection, checkpoint=control.remaining
+                    )
             except PRESENTATION_FAILURES as error:
                 prepared = PreparedRoot(root["ref"], branch.members, None, failure=PreparationFailure.capture(error))
             roots.append(prepared)
         prepared_roots = tuple(roots)
         return PreparedSnapshot(
-            replace(request, snapshot=captured), prepared_roots, prepared_nodes(prepared_roots, captured)
+            replace(request, snapshot=captured),
+            prepared_roots,
+            prepared_nodes(
+                prepared_roots,
+                captured,
+                defer_inactive_selections=request.compact and request.public_api and request.share_descriptions,
+                checkpoint=control.remaining,
+            ),
         )
 
     async def _arun(self, request: SnapshotRenderRequest, control: Control) -> PreparedSnapshot:
@@ -154,22 +205,54 @@ class _RenderPreparedRoots(Node["PreparedSnapshot", "SnapshotParts"]):
     def _run(self, prepared: PreparedSnapshot, control: Control) -> SnapshotParts:
         from dataclasses import replace
 
-        snapshot = prepared.snapshot.materialize()
+        snapshot = prepared.snapshot.materialize(read_only_sources=True, checkpoint=control.remaining)
         request = replace(prepared.request, snapshot=snapshot)
         parts, uncompressed = [], None
-        for root, projection in zip(snapshot.roots, prepared.roots):
-            branch = _branch_facts(snapshot, request, root)
+        visible = {node.ref for node in _checked(prepared.nodes, control.remaining)}
+        for root, projection in _checked(zip(snapshot.roots, prepared.roots), control.remaining):
+            branch = _branch_facts(snapshot, request, root, checkpoint=control.remaining)
             try:
                 if projection.failure is not None:
                     raise projection.failure.exception()
-                renderer = Sequence(
-                    name="RenderPreparedRoot", steps=[RenderPipeline(branch), AccountingPipeline(branch)]
-                )
-                part = renderer.run(projection.materialize(), control)
+                materialized = projection.materialize(checkpoint=control.remaining)
+                if projection.interface is not None and projection.atoms is not None:
+                    renderer = Sequence(
+                        name="RenderPreparedInterface", steps=[InterfaceTextPipeline(), AccountingPipeline(branch)]
+                    )
+                    part = renderer.run(
+                        InterfaceTextRequest(
+                            projection.interface,
+                            projection.atoms,
+                            materialized,
+                            projection.disclosure,
+                            projection.collections,
+                            projection.fields,
+                            projection.sharing,
+                            projection.coverage,
+                            projection.text_slices,
+                            projection.groups,
+                            prepared.snapshot,
+                            projection.readable,
+                        ),
+                        control,
+                    )
+                else:
+                    renderer = Sequence(
+                        name="RenderPreparedRoot", steps=[RenderPipeline(branch), AccountingPipeline(branch)]
+                    )
+                    part = renderer.run(materialized, control)
+                output = getattr(part.rendered, "document", None)
+                displayed = []
+                if isinstance(output, RenderedDocument):
+                    for section in _checked(output.parts, control.remaining):
+                        if isinstance(section, RenderedSection):
+                            displayed.extend(node.ref for node in _checked(section.nodes, control.remaining))
+                if len(displayed) != len(set(displayed)) or set(displayed) != visible.intersection(projection.members):
+                    raise ValueError("Rendered branch does not account for its prepared element references")
             except PRESENTATION_FAILURES as error:
                 if uncompressed is None:
                     uncompressed = UncompressedFacts(snapshot.facts, snapshot.refs)
-                rendered = uncompressed.render(branch.members, error)
+                rendered = uncompressed.render(branch.members, error, refresh=projection.failure is None)
                 _, sources = branch.relations.render(branch.members, rendered)
                 part = RenderedPart(rendered, {}, {}, sources, uncompressed=True)
             parts.append(part)

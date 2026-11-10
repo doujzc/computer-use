@@ -14,7 +14,10 @@ namespace ComputerUse.Windows
         internal string TextValue;
         internal bool TextValueKnown;
         internal bool? Enabled, Replaceable;
+        internal bool? CollapsedExpansion;
         internal bool ActionsComplete;
         internal string[] Actions = new string[0];
+        internal NativeExactActionEvidence ExactAction;
+        internal NativeSelectionInsertOffer SelectionReplacement;
     }
 }

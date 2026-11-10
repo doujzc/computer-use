@@ -9,13 +9,15 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, cast
 
 from computer_use.errors import ComputerUseError
+from computer_use.native.query.directory import SurfaceReadProfile
+from computer_use.native.scopes import FixedWindowInvalidated, FixedWindowUnconfirmed
 from computer_use.interaction.read.acquisition.choices.pipeline import WindowChoiceServiceNode
 from computer_use.interaction.read.acquisition.components.model import ComponentRequest
 from computer_use.interaction.read.acquisition.components.pipeline import ComponentPipeline
 from computer_use.interaction.read.acquisition.components.support import ObservationGap
+from computer_use.interaction.read.acquisition.content import prefer_earlier_budget_capture
 from computer_use.interaction.read.acquisition.directory.service import select_surface
 from computer_use.interaction.read.acquisition.helpers import window_binding
-from computer_use.interaction.read.acquisition.loading import initialization_requested
 from computer_use.interaction.read.acquisition.model import (
     CollectedAttempt,
     Components,
@@ -54,6 +56,7 @@ from computer_use.interaction.read.acquisition.passes.wait_content_change import
 from computer_use.interaction.read.acquisition.scope.pipeline import WorkingScopeServiceNode
 from computer_use.pipeline import Contract, Pipeline, Repeat, Select, Sequence
 from computer_use.pipeline.core import Node
+from computer_use.protocol.session import NativeRequestDeadline
 
 if TYPE_CHECKING:
     from computer_use.interaction.read.acquisition.model import AcquiredObservation
@@ -93,24 +96,41 @@ class _CollectComponents(Node["ReadRunState", "CollectedAttempt"]):
             return CollectedAttempt(state, Components(state.directory, parts.tree, parts.image, gaps=parts.gaps))
         components, gaps = state.components, parts.gaps
         retained = components.gaps
-        if parts.tree is not None:
+        tree = parts.tree
+        if tree is not None and prefer_earlier_budget_capture(components.tree, tree):
+            try:
+                original = select_surface(components.source_directory, state.target.root_window)
+                same_binding = original == state.target and (
+                    components.source_directory["application"] == state.directory["application"]
+                )
+            except ComputerUseError:
+                same_binding = False
+            if same_binding:
+                tree = None
+                gaps += (
+                    ObservationGap(
+                        "tree", "observation_incomplete",
+                        "The newer content refresh had insufficient collection budget; the earlier more complete "
+                        "tree and its original capture interval are retained.",
+                    ),
+                )
+        if tree is not None:
             retained = tuple(gap for gap in retained if gap.component not in ("tree", "view"))
-        elif components.tree is not None:
+        elif parts.tree is None and components.tree is not None:
             gaps += (
                 ObservationGap(
                     "tree",
                     "observation_incomplete",
                     "The content refresh failed; the earlier tree and its capture interval are retained.",
-                    "read again if newer content is needed",
                 ),
             )
         return CollectedAttempt(
             state,
             replace(
                 components,
-                tree=parts.tree if parts.tree is not None else components.tree,
+                tree=tree if tree is not None else components.tree,
                 gaps=retained + gaps,
-                image_precedes_tree=parts.tree is not None,
+                image_precedes_tree=tree is not None or components.image_precedes_tree,
             ),
         )
 
@@ -146,7 +166,8 @@ class _AppMenuCollection(Node["CollectedAttempt", "CollectedAttempt"]):
         services = self.services
         state, components = value.state, value.components
         if (
-            state.plan.limits.get("view") == "image"
+            not state.plan.include_menus
+            or state.plan.limits.get("view") == "image"
             or "nativeApplicationRoots" not in services.port.connection.capabilities
         ):
             return value
@@ -255,6 +276,7 @@ class AcquisitionPipeline(Pipeline["ReadPlan", "AcquiredObservation"]):
                     selection=plan.selection,
                     _control=control,
                     include_overview=plan.limits.get("overview", True),
+                    profile=plan.profile,
                 ) from error
             gaps = (
                 tuple(
@@ -262,7 +284,6 @@ class AcquisitionPipeline(Pipeline["ReadPlan", "AcquiredObservation"]):
                         "applications",
                         "observation_incomplete",
                         reason,
-                        "use the exact observed application identity",
                     )
                     for reason in plan.applications["stopReasons"]
                 )
@@ -273,7 +294,6 @@ class AcquisitionPipeline(Pipeline["ReadPlan", "AcquiredObservation"]):
                 plan,
                 target,
                 plan.directory,
-                initialization_requested(plan.directory, plan.launch),
                 gaps=gaps,
             )
 
@@ -284,14 +304,68 @@ class AcquisitionPipeline(Pipeline["ReadPlan", "AcquiredObservation"]):
                 value: Read-attempt inputs paired with the components actually captured.
             """
             state, components = value.state, value.components
-            # pylint: disable-next=protected-access
-            _, directory = await services._discover(
-                state.plan.selection,
-                cast("Callable[[], int]", control.remaining),
-                accessibility=state.plan.limits.get("view") != "image"
-                and "nativeReadIsolation" not in services.port.connection.capabilities,
-                _control=control,
-            )
+            generation = services.port.connection.session_identity
+            try:
+                # pylint: disable-next=protected-access
+                _, directory = await services._discover(
+                    state.plan.selection,
+                    cast("Callable[[], int]", control.remaining),
+                    accessibility=state.plan.profile is SurfaceReadProfile.ACCESSIBILITY
+                    and "nativeReadIsolation" not in services.port.connection.capabilities,
+                    _control=control,
+                )
+            except (FixedWindowInvalidated, FixedWindowUnconfirmed) as error:
+                directory = error.directory
+                if directory is None or directory["session"] != components.source_directory["session"]:
+                    raise
+                if directory["application"] != components.source_directory["application"]:
+                    raise
+                if window_binding(error.binding) != window_binding(state.target):
+                    raise
+                if components.tree is None and components.image is None:
+                    raise
+                # A later lifetime/confirmation result does not erase what was
+                # actually captured. Keep it as history with its original clock;
+                # the later directory remains authoritative for current scope.
+                gap = ObservationGap(
+                    "scope", "window_closed" if isinstance(error, FixedWindowInvalidated) else "observation_incomplete",
+                    (
+                        "The captured window ended before the later directory; "
+                        if isinstance(error, FixedWindowInvalidated)
+                        else "The captured window is unconfirmed in the later directory; "
+                    )
+                    +
+                    "its original facts, pixels and capture intervals are retained.",
+                )
+                return RecheckedAttempt(
+                    value, directory, state.target, None, False, state.gaps + (gap,),
+                )
+            except (TimeoutError, NativeRequestDeadline) as error:
+                if services.port.calls.retired or services.port.connection.session_identity != generation:
+                    raise
+                native_deadline = isinstance(error, NativeRequestDeadline)
+                if native_deadline and error.effect != "none":
+                    raise
+                if native_deadline and components.tree is None and components.image is None:
+                    raise
+                # Preserve the capture's own catalogue and fixed target. A
+                # failed newer lookup cannot establish a different current
+                # window or erase facts/pixels already acquired. Identity
+                # failures still propagate their newer directory evidence.
+                gap = ObservationGap(
+                    "directory",
+                    "observation_incomplete",
+                    "Window directory recheck budget exhausted: "
+                    + (error.detail if isinstance(error, NativeRequestDeadline) else str(error)),
+                )
+                return RecheckedAttempt(
+                    value,
+                    components.source_directory,
+                    state.target,
+                    None,
+                    False,
+                    state.gaps + (gap,),
+                )
             # pylint: disable-next=protected-access
             confirmed, gaps = services._complete_scope(directory), state.gaps
             try:

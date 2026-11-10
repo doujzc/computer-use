@@ -1,20 +1,18 @@
 # coding: utf-8
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 
-"""Determine App-instance membership from confirmed window-parent paths."""
+"""Confirm explicit Window containment independently of application ownership."""
 
 from __future__ import annotations
 
-from collections.abc import Iterator
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, cast
 
 from computer_use.native.contracts import Knowledge
-from computer_use.session.interfaces import DirectoryMembership, WindowIdentity, WindowMembership
+from computer_use.session.surface_content import content_within
 
 if TYPE_CHECKING:
     from computer_use.interaction.records import UIHandle
     from computer_use.protocol.records import NativeDirectory as DirectoryFacts
-    from computer_use.protocol.records import SurfaceInfo
 
 
 def ancestry(directory: DirectoryFacts, window: str, root: str) -> Knowledge:
@@ -36,17 +34,6 @@ def ancestry(directory: DirectoryFacts, window: str, root: str) -> Knowledge:
     return Knowledge.UNKNOWN
 
 
-def membership_evidence(directory: DirectoryFacts, root: str) -> DirectoryMembership:
-    """Separate catalogue completeness from each window's relationship evidence."""
-    return DirectoryMembership(
-        not directory["stopReasons"],
-        tuple(
-            WindowMembership(WindowIdentity.of(item), ancestry(directory, item["window"], root))
-            for item in directory["surfaces"]
-        ),
-    )
-
-
 def ancestor(directory: DirectoryFacts, window: str, root: str) -> bool:
     """Return whether a window is the root or a confirmed descendant of it.
 
@@ -58,27 +45,21 @@ def ancestor(directory: DirectoryFacts, window: str, root: str) -> bool:
     return ancestry(directory, window, root) is Knowledge.YES
 
 
-def roots(directory: DirectoryFacts) -> list[SurfaceInfo]:
-    """List non-menu windows whose parent is outside the confirmed catalogue."""
-
-    def _iter_item(_source_items: Iterator[Any]) -> Iterator[Any]:
-        for item in _source_items:
-            if item["kind"] != "menu" and (
-                item["parentState"] != "known"
-                or not any(other["window"] == item["parent"] for other in directory["surfaces"])
-            ):
-                yield item
-
-    return list(_iter_item(iter(directory["surfaces"])))
-
-
 def in_scope(ui: UIHandle, surface: str | None) -> bool:
-    """Check whether a native surface belongs to the App/Window view."""
+    """Check whether a native surface belongs to the App/window view."""
     # The pipeline shares retained bindings with their owning service.
     # pylint: disable-next=protected-access
     instance = ui._instance
+    # pylint: disable-next=protected-access
+    anchor = ui._anchor
     item = next((item for item in instance.members.values() if item["surface"] == surface), None)
+    if getattr(ui, "_strict_window", False):
+        return item is not None and item["window"] == anchor
     return item is not None and (
-        # pylint: disable-next=protected-access
-        ui._anchor is None or ancestor(cast("DirectoryFacts", instance.directory), item["window"], ui._anchor)
+        anchor is None or interaction_contains(cast("DirectoryFacts", instance.directory), item["window"], anchor)
     )
+
+
+def interaction_contains(directory: DirectoryFacts, window: str, root: str) -> bool:
+    """Observation/name-query scope includes proved attached control content."""
+    return content_within({item["window"]: item for item in directory["surfaces"]}, window, root)
