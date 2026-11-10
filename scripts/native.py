@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from computer_use.json import loads as jsonLoads
-from computer_use.paths import native_driver, repository_root
+from computer_use.paths import LINUX_RUNTIME, linux_python, native_driver, repository_root
 from computer_use.protocol.session import NATIVE_PROTOCOL_VERSION
 
 from .console import report
@@ -74,6 +74,78 @@ def _protocol_version(version):
     return version
 
 
+def stage_linux_runtime(root, destination):
+    """Package the driver and its Python dependencies for the host's desktop Python."""
+    native = root / "os_adapter/linux"
+    desktop_python = linux_python()
+    probe = run(
+        desktop_python,
+        [
+            "-I", "-S", "-c",
+            "import json, sys, sysconfig\n"
+            "if sys.implementation.name != 'cpython' or sys.version_info < (3, 11):\n"
+            "    sys.exit('Linux driver requires system CPython >= 3.11')\n"
+            "sys.stdout.write(json.dumps([sys.version_info[:2], "
+            "bool(sysconfig.get_config_var('Py_GIL_DISABLED')), sysconfig.get_config_var('SOABI')]))\n",
+        ],
+        native,
+        True,
+    )
+    try:
+        (major, minor), free_threaded, soabi = json.loads(probe)
+        version_is_valid = isinstance(major, int) and isinstance(minor, int)
+        abi_is_valid = isinstance(free_threaded, bool) and (soabi is None or isinstance(soabi, str))
+        if not version_is_valid or not abi_is_valid:
+            raise ValueError("Invalid desktop Python version or ABI")
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(f"Could not read the Linux desktop Python version and ABI from {desktop_python}.") from error
+    wheel_abi = f"cp{major}{minor}{'t' if free_threaded else ''}"
+    run(
+        sys.executable,
+        [
+            "-m", "pip", "install", "--target", destination, "--no-deps", "--no-compile",
+            "--only-binary=:all:", "--python-version", f"{major}.{minor}", "--implementation", "cp",
+            "--abi", wheel_abi, "-r", "requirements.lock",
+        ],
+        native,
+    )
+    shutil.copytree(
+        native / "src/computer_use_linux", destination / "computer_use_linux",
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    (destination / "__main__.py").write_text(
+        "import sys\nimport sysconfig\n\n"
+        "if (\n"
+        f"    sys.version_info[:2] != {(major, minor)!r}\n"
+        f"    or bool(sysconfig.get_config_var('Py_GIL_DISABLED')) != {free_threaded!r}\n"
+        f"    or sysconfig.get_config_var('SOABI') != {soabi!r}\n"
+        "):\n"
+        "    raise SystemExit('Desktop Python changed. Rebuild the Computer Use wheel without the pip cache.')\n\n"
+        "from computer_use_linux.__main__ import main\n\n"
+        "raise SystemExit(main())\n",
+        encoding="utf-8",
+    )
+
+
+def bundle_wheel_backend(root: Path, output: Path, platform_tag: str) -> None:
+    """Build the host's driver and copy it into the wheel's resource tree."""
+    if sys.platform == "darwin":
+        bundle = build_mac_os(root, configuration="release").parents[2]
+        shutil.copytree(bundle, output / bundle.relative_to(root))
+    elif sys.platform == "win32":
+        driver = build_windows(root)
+        destination = output / driver.parent.relative_to(root)
+        destination.mkdir(parents=True, exist_ok=True)
+        for name in (driver.name, "computer-use-capture.exe", "Interop.NativeUIA.dll"):
+            shutil.copy2(driver.parent / name, destination / name)
+    else:
+        stage_linux_runtime(root, output / LINUX_RUNTIME)
+    (output / "backend.json").write_text(
+        json.dumps({"platform": platform_tag, "protocol": NATIVE_PROTOCOL_VERSION}),
+        encoding="utf-8",
+    )
+
+
 def build_linux(root=None, *, protocol_version=NATIVE_PROTOCOL_VERSION):
     _protocol_version(protocol_version)
     if sys.platform != "linux":
@@ -85,7 +157,7 @@ def build_linux(root=None, *, protocol_version=NATIVE_PROTOCOL_VERSION):
     if bundled and wheel is None:
         raise RuntimeError("Bundled Linux backend wheel is missing. Reinstall openjiuwen-computeruse.")
     import_path = str(wheel) if bundled else "src"
-    python = os.environ.get("COMPUTER_USE_PYTHON") or "/usr/bin/python3"
+    python = linux_python()
     check = (
         f"from computer_use_linux.runtime.resources import check_installation; check_installation({protocol_version}"
     )
@@ -149,6 +221,8 @@ def build_native(root=None, *, protocol_version=NATIVE_PROTOCOL_VERSION):
     root = Path(root) if root else repository_root()
     if sys.platform in ("darwin", "win32") and (root / "backend.json").is_file():
         return Path(native_driver(root=root)["command"])
+    if sys.platform == "linux" and (root / LINUX_RUNTIME / "__main__.py").is_file():
+        return Path(linux_python())
     if sys.platform == "darwin":
         return build_mac_os(root)
     if sys.platform == "linux":
@@ -435,3 +509,8 @@ def permissions_cli():
 
 def linux_launcher_cli():
     return _cli(linux_session_launcher) or None
+
+
+if __name__ == "__main__":
+    source_dir, resource_dir, wheel_platform = sys.argv[1:]
+    bundle_wheel_backend(Path(source_dir), Path(resource_dir), wheel_platform)
