@@ -54,7 +54,10 @@ class Cleanup(str, Enum):
 
 
 INTENTS = frozenset(
-    ("click", "focus", "insert", "replace", "paste", "key", "openMenu", "action", "scroll", "drag", "launch")
+    (
+        "click", "focus", "insert", "replace", "paste", "key", "openMenu", "action", "scroll", "drag", "launch",
+        "closeWindow",
+    )
 )
 
 
@@ -64,10 +67,14 @@ class Intent:
 
     kind: str
     parameters: Mapping[str, Any] = field(default_factory=dict)
+    global_input: bool = False
 
     def __post_init__(self):
         if self.kind not in INTENTS:
             raise ValueError(f"Unknown execution intent: {self.kind}")
+        global_input = self.global_input
+        if global_input is not True and global_input is not False:
+            raise TypeError("global_input must be a boolean")
         object.__setattr__(self, "parameters", MappingProxyType(dict(self.parameters)))
 
 
@@ -132,7 +139,22 @@ class ApplicationBinding:
         return value
 
 
-OperationTarget = Binding | ApplicationBinding
+@dataclass(frozen=True)
+class GlobalTarget:
+    """A connection's global input sink, independent of observed UI objects."""
+
+    session: str
+
+    def same_target(self, other: object) -> bool:
+        return self == other
+
+    def canonical(self, value):
+        if value != self:
+            raise ValueError("Native begin changed the global input session")
+        return value
+
+
+OperationTarget = Binding | ApplicationBinding | GlobalTarget
 
 
 @dataclass(frozen=True)
@@ -142,6 +164,7 @@ class OpenedOperation:
     token: str
     target: OperationTarget
     click_contract: str | None = None
+    app_change_baseline: Mapping[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -353,7 +376,7 @@ class ClickOffer:
     preference_profile: str = "default"
 
     def wire(self):
-        return dict(
+        value = dict(
             routeFamily=self.route_family,
             interaction=self.interaction,
             delivery=self.delivery,
@@ -362,6 +385,7 @@ class ClickOffer:
             preparationOptions=list(self.preparation_options),
             preferenceProfile=self.preference_profile,
         )
+        return value
 
 
 @dataclass(frozen=True)
@@ -408,11 +432,21 @@ class ClickReceipt:
     @property
     def permits_replanning(self) -> bool:
         return self.continuation.kind in ("sameCandidateRefresh", "reselectWithinScope") and all(
-            p.effect == "contextOnly"
-            and (
-                p.continuation == "withinScope"
-                or self.continuation.kind == "sameCandidateRefresh"
-                and p.continuation == "sameCandidate"
+            (
+                p.effect == "contextOnly"
+                and (
+                    p.continuation == "withinScope"
+                    or self.continuation.kind == "sameCandidateRefresh"
+                    and p.continuation == "sameCandidate"
+                )
+            )
+            or (
+                p.kind == "pointerPreparation"
+                and not self.transport_evidence.call_entered
+                and p.effect == "contentPossible"
+                and p.dispatch == Dispatch.DISPATCHED
+                and p.continuation == "withinScope"
+                and "originalTargetViewportProgress=confirmed" in p.observations
             )
             for p in self.preparation_evidence
         )
@@ -438,6 +472,39 @@ class ClickSelectionDecision:
 
 
 @dataclass(frozen=True)
+class PreparationImpact:
+    """Potential preparation effects declared by a specific native recipe."""
+
+    mouse: Knowledge = Knowledge.UNKNOWN
+    keyboard: Knowledge = Knowledge.UNKNOWN
+    activation: Knowledge = Knowledge.UNKNOWN
+    clipboard: Knowledge = Knowledge.UNKNOWN
+
+
+@dataclass(frozen=True)
+class InputEffect:
+    """Grouped native invocation evidence; never application consumption."""
+
+    stage: str
+    device: str
+    transport: str
+    mechanism: str
+    state: str
+
+
+@dataclass(frozen=True)
+class NativeImpact:
+    """Actual evidence from one native execution range, with explicit coverage."""
+
+    coverage: str
+    effects: tuple[InputEffect, ...]
+    foreground_changed: Knowledge
+    clipboard_restoration: str
+    omitted_effects: int = 0
+    foreground_restoration: str = "unavailable"
+
+
+@dataclass(frozen=True)
 class Primitive:
     """Driver-declared execution unit with its support and readiness evidence."""
 
@@ -451,6 +518,9 @@ class Primitive:
     action: str | None = None
     action_description: str | None = None
     click: ClickOffer | None = None
+    global_input: Knowledge = Knowledge.UNKNOWN
+    preparation_impact: PreparationImpact | None = None
+    keyboard_editing: Literal["insert", "replace"] | None = None
 
     def __post_init__(self):
         from computer_use.protocol.execution import unit_contracts
@@ -458,6 +528,14 @@ class Primitive:
         if self.unit not in unit_contracts or not self.id:
             raise ValueError("Invalid native primitive contract")
         validate_primitive_contract(self.unit, self.channel, self.supported, self.readiness, self.pending, self.action)
+        if self.keyboard_editing is not None:
+            keyboard_primitive = (
+                self.keyboard_editing in ("insert", "replace")
+                and self.unit == "key_sequence"
+                and self.channel == Channel.KEYBOARD
+            )
+            if not keyboard_primitive or self.global_input != Knowledge.NO:
+                raise ValueError("Keyboard editing evidence requires an addressed keyboard primitive")
         if self.unit == "native_selection" and self.click is None:
             raise ValueError("Native selection requires an integrated click offer")
         if self.click is not None:
@@ -498,18 +576,14 @@ class Facts:
 
 @dataclass(frozen=True)
 class HostPolicy:
-    """Host-selected desktop mode and permission for foreground assistance."""
+    """Explicit input permission, independent of target focus and preparation."""
 
-    mode: str = "shared"
-    foreground_assist: bool = False
+    allow_global_input: bool = True
 
     def __post_init__(self):
-        if self.mode not in ("shared", "exclusive"):
-            raise ValueError("Unknown desktop mode")
-
-    @property
-    def foreground_allowed(self):
-        return self.mode == "exclusive" or self.foreground_assist
+        allow_global_input = self.allow_global_input
+        if allow_global_input is not True and allow_global_input is not False:
+            raise TypeError("allow_global_input must be a bool")
 
 
 @dataclass(frozen=True)
@@ -542,6 +616,8 @@ class StepResult:
     context: Mapping[str, Any] | None = None
     application: Mapping[str, Any] | None = None
     click: ClickReceipt | None = None
+    impact: NativeImpact | None = None
+    app_change_input_baseline: Mapping[str, str] | None = None
 
     def __post_init__(self):
         if self.retry_reason not in (None, "routeUnavailable", "preparationUnavailable", "preconditionChanged"):

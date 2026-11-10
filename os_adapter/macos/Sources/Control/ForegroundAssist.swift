@@ -8,7 +8,6 @@ import ApplicationServices
 /// background preparation and no requested input dispatch. This primitive owns
 /// no fallback policy, request-local input state or foreground/pointer cleanup.
 @MainActor struct ForegroundAssist {
-    static let enabled = ProcessInfo.processInfo.environment["COMPUTER_USE_FOREGROUND_ASSIST"] == "1"
 
     /// Diagnostic-only facts from the existing activation boundary. No extra
     /// AX request, activation, event, retry or wait is performed here.
@@ -72,12 +71,14 @@ import ApplicationServices
 
     private static func activate(
         _ target: BackgroundTarget, window: CGWindowID, pointerAt: CGPoint? = nil,
-        onWait: (NativePreparationWait) -> Void, onCleanupUnknown: @escaping @MainActor () -> Void
+        onWait: (NativePreparationWait) -> Void, onCleanupUnknown: @escaping @MainActor () -> Void,
+        beforeAction: @escaping @MainActor () throws -> Void
     ) async throws {
         let app = target.application
         let pid = app.processIdentifier
         let native = try nativeWindow(pid, window)
         func checkPreparation() throws {
+            try beforeAction()
             try RequestDiagnostics.checkCancellation()
             try target.validate(input: true)
             guard let info = WindowServerInfo.window(window),
@@ -182,18 +183,21 @@ import ApplicationServices
     }
 
     func prepare(
-        _ target: BackgroundTarget, window: CGWindowID, pointerAt: CGPoint? = nil, onAction: () -> Void,
-        onWait: (NativePreparationWait) -> Void = { _ in }, onCleanupUnknown: @escaping @MainActor () -> Void = {}
+        _ target: BackgroundTarget, window: CGWindowID, pointerAt: CGPoint? = nil,
+        reusePointerAt: CGPoint? = nil, onAction: () -> Void,
+        onWait: (NativePreparationWait) -> Void = { _ in }, onCleanupUnknown: @escaping @MainActor () -> Void = {},
+        beforeAction: @escaping @MainActor () throws -> Void = {}
     ) async throws {
-        guard Self.enabled || BackgroundTarget.isExclusive else {
-            throw DriverError("foreground input is not enabled by this host", code: .modeUnsupported)
-        }
         try target.validate(input: true)
-        try BackgroundTarget.validateReleasedInput()
+        NativeForegroundResponsibility.current?.requireForegroundForCandidate()
         _ = try Self.nativeWindow(target.application.processIdentifier, window)
         // Preserve the document's existing first responder when its exact
         // foreground context is already established. No activation is needed.
-        if pointerAt == nil, target.isForeground, Self.focusedWindow(target.application.processIdentifier) == window {
+        if pointerAt == nil, Self.canReuseFocusedWindow(
+            foreground: target.isForeground, window: window,
+            focused: Self.focusedWindow(target.application.processIdentifier),
+            pointerAt: reusePointerAt, hit: BackgroundEvents.inputWindow)
+        {
             onWait(.notNeeded)
             return
         }
@@ -208,10 +212,27 @@ import ApplicationServices
             )
             return
         }
+        guard NativeForegroundResponsibility.current?.permitsForegroundPreparation() != false else {
+            throw NativePreparationUnavailable(
+                description: "the user selected a new foreground during this operation; no repeated activation sent")
+        }
+        try beforeAction()
+        NativeForegroundResponsibility.current?.recordPreparation(target: target.capturedProcessIdentity, foreground: true)
         onAction()
         try await Self.activate(
-            target, window: window, pointerAt: pointerAt, onWait: onWait, onCleanupUnknown: onCleanupUnknown)
+            target, window: window, pointerAt: pointerAt, onWait: onWait, onCleanupUnknown: onCleanupUnknown,
+            beforeAction: beforeAction)
         try target.validate(input: true)
         diagnose("foreground assist: prepared pid=\(target.application.processIdentifier), window=\(window)")
+    }
+
+    /// Some clicks require both the standard window's key context and its
+    /// physical point to be exposed. Preserve the former when the latter has
+    /// already been proved, or prepare again when another window covers it.
+    static func canReuseFocusedWindow(
+        foreground: Bool, window: CGWindowID, focused: @autoclosure () -> CGWindowID?,
+        pointerAt: CGPoint?, hit: (CGPoint) -> CGWindowID?
+    ) -> Bool {
+        foreground && focused() == window && (pointerAt.map { hit($0) == window } ?? true)
     }
 }

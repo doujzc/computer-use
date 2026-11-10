@@ -19,10 +19,18 @@ namespace ComputerUse.Windows
         {
             var target = Wire.Object(command["target"]);
             string unit = Wire.Str(command, "kind"), id = Wire.Str(command, "primitiveId");
-            var result = Wire.Obj("target", new Dictionary<string, object>(target), "dispatch", "notDispatched", "detail", "No native input dispatched.", "preparation", new string[0], "confirmation", "unavailable", "cleanup", "complete", "errorCode", null, "retryReason", null, "context", null);
+            var result =
+                Wire.Obj("target", new Dictionary<string, object>(target), "dispatch", "notDispatched", "detail",
+                         "No native input dispatched.", "preparation", new string[0], "confirmation", "unavailable",
+                         "cleanup", "complete", "errorCode", null, "retryReason", null, "context", null);
             try
             {
-                var plan = ResolveNativeTargetPass.Run(operation, command, target, unit, id);
+                var plan = ResolveNativeTargetPass.Run(operation, command, target, unit, id, provider);
+                if (plan.Contract.SelectionInsert != null)
+                {
+                    NativeSelectionInsertPipeline.Run(plan.Contract.SelectionInsert, plan.Text, operation, r, result);
+                    return result;
+                }
                 var state = ReadInitialTargetPass.Run(plan, r, provider);
                 var mutate = PrepareNativeUnitPass.Run(plan, state, r, provider);
                 CheckDispatchConditionsPass.Run(plan, r, provider);
@@ -30,7 +38,7 @@ namespace ComputerUse.Windows
                 SendNativeUnitPass.Run(mutate, result);
                 if (operation.ClickV1)
                     operation.Click.Completed();
-                result["detail"] = "Native object operation returned; read the control to verify its effect.";
+                result["detail"] = "Native object operation returned.";
                 if (unit == "native_text_edit")
                     ObserveObjectEffectPass.Run(plan, state, r, result, provider);
                 r.Check();

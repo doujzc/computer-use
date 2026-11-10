@@ -27,8 +27,8 @@ def create(*, services: NativeAppReader) -> Callable[[ComponentLease, Control], 
     async def collect(value: ComponentLease, control: Control) -> ComponentLease:
         """Attach requested window pixels or supported capture gaps to the component lease.
 
-        Report missing native-capture support as an image gap. Otherwise collect within half the
-        remaining budget and retain capture-state notes with the image result.
+        Report missing native-capture support as an image gap. Otherwise reuse the
+        enclosing deadline and retain capture-state notes with the image result.
         """
         request, parts = value.request, value.parts
         if not request.include_image:
@@ -36,16 +36,15 @@ def create(*, services: NativeAppReader) -> Callable[[ComponentLease, Control], 
         if "nativeCapture" not in services.port.capabilities:
             gap = ObservationGap(
                 "image",
-                "mode_unsupported",
+                "unsupported_operation",
                 "This driver does not declare window capture.",
-                "use a driver with nativeCapture support",
             )
             return replace(value, parts=replace(parts, gaps=parts.gaps + (gap,)))
         image, gap = await collect_component(
             services.port,
             "image",
             lambda: services.images.collect(
-                value.read.bounded(max(1, control.remaining() // 2)), max_dimension=request.limits["max_dimension"]
+                value.read.bounded(control.remaining()), max_dimension=request.limits["max_dimension"]
             ),
         )
         return replace(

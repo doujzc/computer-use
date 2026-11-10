@@ -10,6 +10,7 @@ from dataclasses import replace
 
 from computer_use.errors import ComputerUseError
 from computer_use.native.contracts import SelectionDependency
+from computer_use.native.scopes import QueryRootUnavailable
 from computer_use.native.semantics import (
     EDITING_FIELDS,
     FIELDS,
@@ -25,7 +26,6 @@ __all__ = ["UNKNOWN", "NativeGraph"]
 
 class NativeGraph:
     failure_target = "input receiver"
-    failure_next = "read the intended control or use its window observation; no input was sent by this lookup"
 
     def __init__(self, port, operation, root, remaining, *, fields, max_nodes=4096, max_depth=40, follow_relations=()):
         self.port, self.operation, self.root, self.remaining = port, operation, root, remaining
@@ -36,6 +36,7 @@ class NativeGraph:
         self.relations = {semantic: native for native, semantic in RELATIONS[self.platform].items()}
         self.fields = tuple(fields)
         self.follow_relations = tuple(follow_relations)
+        self.query_options = {}
         self.max_nodes, self.max_depth = max_nodes, max_depth
         invalid_max_nodes = (
             True
@@ -52,6 +53,7 @@ class NativeGraph:
         if invalid_max_nodes:
             raise ValueError("Invalid native query budget")
         self.nodes, self.edges, self.completed_edges = {}, {}, {}
+        self.outside_window_nodes = set()
         self.node_sources, self.edge_sources, self.dependencies = {}, {}, {}
 
     def _use(self, observed, node, *, fields=(), actions=False, relations=()):
@@ -99,16 +101,19 @@ class NativeGraph:
         if matches_edge:
             self.fail("observation_incomplete", "The control containment has conflicting native parent evidence.")
 
-    def fail(self, code, detail):
-        raise ComputerUseError(
+    def fail(self, code, detail, *, observation_reason=None):
+        error = ComputerUseError(
             dict(
                 code=code,
                 effect="none",
                 target=self.failure_target,
                 detail=detail,
-                next=self.failure_next,
             )
         )
+        # Internal failure metadata requests observation without changing the public error.
+        # pylint: disable-next=protected-access
+        error._observation_reason = observation_reason
+        raise error
 
     async def _node(self, token, *, depth=None):
         self.remaining()
@@ -118,10 +123,23 @@ class NativeGraph:
                 self.fail("observation_incomplete", "Query exhausted its native node budget.")
             batch = await self._collect_nodes(token, available, self.max_depth if depth is None else depth)
             self._remember_nodes(batch)
-        return self.nodes[token]
+        node = self.nodes[token]
+        if self.platform == "macos" and token == self.root.node:
+            status = node["fieldStatus"].get(self.properties.get("role"), {})
+            if (
+                status.get("state") == "error" and status.get("nativeDomain") == "AXError"
+                and status.get("nativeCode") == -25202  # kAXErrorInvalidUIElement
+            ):
+                # Failed descendants/optional fields remain ordinary incomplete
+                # evidence. Only this exact root proxy has been disproved;
+                # neither its physical Window nor its App has ended.
+                raise QueryRootUnavailable(self.root, native_domain="AXError", native_code=-25202)
+        return node
 
     async def _collect_nodes(self, token, available, depth, *, relation_page=None):
-        options = dict(follow_relations=self.follow_relations) if self.follow_relations else {}
+        options = dict(self.query_options)
+        if self.follow_relations:
+            options["follow_relations"] = self.follow_relations
         if relation_page is not None:
             options["relation_page"] = relation_page
         batch = await self.port.query_nodes(
@@ -149,6 +167,8 @@ class NativeGraph:
         return batch
 
     def _remember_nodes(self, batch):
+        if self.query_options.get("strict_window"):
+            self.outside_window_nodes.update(batch.get("outsideWindowNodes", ()))
         # Earlier facts keep their collection identity. Supplementary reads
         # do not quietly overwrite a branch already used for matching.
         new = {n["node"] for n in batch["nodes"]} - self.nodes.keys()
@@ -217,6 +237,7 @@ class NativeGraph:
                 can_batch
                 and relation["certainty"] == "confirmed"
                 and relation["state"] in ("complete", "partial")
+                and not relation.get("unavailablePositions")
                 and any(target not in self.nodes for target in relation["targets"])
             )
             else False
@@ -238,6 +259,7 @@ class NativeGraph:
                 if (
                     collected is None
                     or collected["targets"] != relation["targets"]
+                    or collected.get("unavailablePositions")
                     or len(collected["targets"]) > limit
                     or collected.get("offset", 0) != relation.get("offset", 0)
                     or collected.get("total") != relation.get("total")
@@ -314,6 +336,8 @@ class NativeGraph:
                 or relation.get("offset", 0) != 0
             ):
                 self.fail("observation_incomplete", "Required native relation is incomplete: " + kind)
+            if relation.get("unavailablePositions"):
+                self.fail("observation_incomplete", "Required native relation contains unavailable object slots.")
             result = list(relation["targets"])
             seen = set()
             while relation.get("cursor") is not None or (
@@ -342,6 +366,8 @@ class NativeGraph:
                 )
                 if matches_token:
                     self.fail("observation_incomplete", "Relation changed while resolving the target.")
+                if next_relation.get("unavailablePositions"):
+                    self.fail("observation_incomplete", "Required native relation contains unavailable object slots.")
                 if batch is not None:
                     self._remember_nodes(batch)
                 self.edge_sources[cache_key].append(page["observed"]["id"])

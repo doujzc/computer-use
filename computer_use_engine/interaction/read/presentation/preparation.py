@@ -6,15 +6,32 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
+from dataclasses import fields as dataclass_fields
+from functools import cached_property
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 from computer_use.interaction.read.presentation.fallback import display_node_facts
+from computer_use.interaction.read.presentation.interface.disclosure.groups.model import BackgroundOverview
+from computer_use.interaction.read.presentation.interface.signatures import interface_layout_signatures
 from computer_use.interaction.read.presentation.ir import ProjectionInput, ProjectionResult, freeze, thaw
 from computer_use.interaction.read.presentation.model import SnapshotRenderRequest
+from computer_use.interaction.read.presentation.selection_summary import selection_summary_plan
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from computer_use.interaction.read.presentation.interface.atoms.model import AtomDocument
+    from computer_use.interaction.read.presentation.interface.collections.model import CollectionDocument
+    from computer_use.interaction.read.presentation.interface.composition.content.model import FieldContentPlan
+    from computer_use.interaction.read.presentation.interface.coverage.model import CoveragePlan
+    from computer_use.interaction.read.presentation.interface.disclosure.groups.model import GroupDisclosurePlan
+    from computer_use.interaction.read.presentation.interface.disclosure.model import DisclosurePlan
+    from computer_use.interaction.read.presentation.interface.model import InterfaceDocument
+    from computer_use.interaction.read.presentation.interface.readable.model import ReadablePlan
+    from computer_use.interaction.read.presentation.interface.sharing.model import SharingPlan
+    from computer_use.interaction.read.presentation.interface.sharing.text_slices.model import TextSliceDocument
     from computer_use.interaction.read.presentation.ir import PresentedValue
     from computer_use.interaction.read.presentation.records import RenderedTree, SnapshotFacts
     from computer_use.pipeline.core import Control
@@ -40,62 +57,127 @@ class _MaterializedSnapshot:
     driver_features: frozenset[str]
     collection: DriverReadMetadata | None = None
 
+    @cached_property
+    def presentation_nodes(self):
+        return {node["node"]: node for node in self.facts["nodes"]}
 
-def _copy_collections(value: Any, *, immutable: bool) -> Any:
-    """Copy nested fact collections without consuming Python recursion depth."""
-    containers = (Mapping, tuple, list, set, frozenset)
-    concrete_containers = (dict, MappingProxyType, tuple, list, set, frozenset)
-    atomic = (str, int, float, bool, type(None), bytes)
+    @cached_property
+    def presentation_relations(self):
+        from .accounting.relations import RelationPresentation
 
-    def is_container(item: Any) -> bool:
-        # Native fact batches contain many scalar property/status values.
-        # Avoid an ABC Mapping lookup for every scalar on every frozen copy;
-        # retain the generic check for custom mappings/container subclasses.
-        kind = type(item)
-        return kind in concrete_containers or kind not in atomic and isinstance(item, containers)
+        return RelationPresentation(self.facts, self.refs)
 
-    def is_mapping(item: Any) -> bool:
-        kind = type(item)
-        return kind in (dict, MappingProxyType) or kind not in concrete_containers and isinstance(item, Mapping)
 
+def _copy_collections(value: Any, *, immutable: bool, checkpoint: Callable[[], object] | None = None) -> Any:
+    """Detach nested fact collections while retaining their shared-child identity.
+
+    Iterative traversal supports deep captured trees and rejects collection cycles.
+    Container categories are cached per concrete type; atomic values, including
+    immutable native records, retain their identity and skip the traversal stack.
+
+    Args:
+        value: Captured facts or a nested collection to copy. Mapping keys stay intact.
+        immutable: Produce mapping proxies, tuples, and frozen sets when true;
+            otherwise produce dictionaries, lists, and sets.
+        checkpoint: Original call-budget check, consulted within bounded work batches.
+
+    Returns:
+        A detached collection graph, or the original value when it is atomic.
+
+    Raises:
+        ValueError: A collection contains itself through its descendants.
+    """
+    if checkpoint is not None:
+        checkpoint()
+    work = 0
+
+    def progress() -> None:
+        nonlocal work
+        work += 1
+        if checkpoint is not None and work % 128 == 0:
+            checkpoint()
+
+    mapping, sequence, setlike = 1, 2, 3
+    categories: dict[type, int] = {
+        dict: mapping,
+        MappingProxyType: mapping,
+        tuple: sequence,
+        list: sequence,
+        set: setlike,
+        frozenset: setlike,
+    }
+
+    def category(item: Any) -> int:
+        """Classify each concrete type once, retaining Mapping subclass support."""
+        concrete_type = type(item)
+        selected = categories.get(concrete_type)
+        if selected is None:
+            selected = (
+                mapping
+                if isinstance(item, Mapping)
+                else sequence
+                if isinstance(item, (tuple, list))
+                else setlike
+                if isinstance(item, (set, frozenset))
+                else 0
+            )
+            categories[concrete_type] = selected
+        return selected
+
+    if not category(value):
+        return value
     completed: dict[int, Any] = {}
     active: set[int] = set()
-    pending = [(value, False)]
+    pending = [(value, category(value), None, None)]
     while pending:
-        current, finish = pending.pop()
-        if not is_container(current) or id(current) in completed:
+        progress()
+        current, kind, local, children = pending.pop()
+        identity = id(current)
+        if identity in completed:
             continue
-        if not finish:
-            if id(current) in active:
+        if local is None:
+            if identity in active:
                 raise ValueError("Captured presentation facts contain a collection cycle")
-            active.add(id(current))
-            pending.append((current, True))
-            children = current.values() if is_mapping(current) else current
-            pending.extend((child, False) for child in reversed(tuple(children)))
+            active.add(identity)
+            local = {} if kind == mapping else []
+            items = current.items() if kind == mapping else enumerate(current)
+            children = []
+            # Scan even a single large container in bounded batches. Atomic
+            # fields retain their identity and never enter the traversal stack.
+            for key, child in items:
+                progress()
+                if kind == mapping:
+                    local[key] = child
+                else:
+                    local.append(child)
+                child_kind = category(child)
+                if child_kind:
+                    children.append((key, child, child_kind))
+            pending.append((current, kind, local, children))
+            for _, child, child_kind in reversed(children):
+                progress()
+                pending.append((child, child_kind, None, None))
             continue
-
-        def copied(item: Any) -> Any:
-            return completed[id(item)] if is_container(item) else item
-
-        if is_mapping(current):
-            result = {key: copied(item) for key, item in current.items()}
-            completed[id(current)] = MappingProxyType(result) if immutable else result
-        elif isinstance(current, (set, frozenset)):
-            result = (copied(item) for item in current)
-            completed[id(current)] = frozenset(result) if immutable else set(result)
+        for key, child, _ in children:
+            progress()
+            local[key] = completed[id(child)]
+        if kind == mapping:
+            completed[identity] = MappingProxyType(local) if immutable else local
+        elif kind == setlike:
+            completed[identity] = frozenset(local) if immutable else set(local)
         else:
-            result = [copied(item) for item in current]
-            completed[id(current)] = tuple(result) if immutable else result
-        active.remove(id(current))
-    return completed.get(id(value), value)
+            completed[identity] = tuple(local) if immutable else local
+        active.remove(identity)
+    return completed[id(value)]
 
 
 @dataclass(frozen=True)
 class CapturedSnapshot:
     """Freeze the captured facts and aliases used to prepare one display.
 
-    Every collection is detached from its originating snapshot. Rendering creates a
-    request-local copy so neither later observations nor callers can change this view.
+    Immutable source graphs closed by their producer are shared, and unproven
+    collections are detached. Rendering creates local display copies, retaining
+    this capture independently of later observations and caller edits.
     """
 
     native: NativeObservation
@@ -111,22 +193,51 @@ class CapturedSnapshot:
     driver_features: frozenset[str]
     collection: DriverReadMetadata | None = None
 
-    @classmethod
-    def capture(cls, snapshot: SnapshotFacts) -> CapturedSnapshot:
-        """Copy and freeze the facts needed by compression and source accounting."""
-        return cls(
-            **{
-                item.name: _copy_collections(
-                    getattr(snapshot, item.name, None) if item.name == "collection" else getattr(snapshot, item.name),
-                    immutable=True,
-                )
-                for item in fields(cls)
-            }
-        )
+    @cached_property
+    def geometric_index(self):
+        """Capture-wide immutable evidence; each layout keeps its own scope."""
+        from .interface.geometric.source import GeometricSourceIndex
 
-    def materialize(self) -> SnapshotFacts:
-        """Return a local semantic snapshot for the existing pure presentation routines."""
-        values = {item.name: _copy_collections(getattr(self, item.name), immutable=False) for item in fields(self)}
+        return GeometricSourceIndex.capture(self)
+
+    @classmethod
+    def capture(cls, snapshot: SnapshotFacts, *, checkpoint: Callable[[], object] | None = None) -> CapturedSnapshot:
+        """Retain proven immutable sources and detach the editable display forest."""
+        from computer_use.interaction.read.facts.snapshot import _captured_sources
+
+        sources = _captured_sources(snapshot)
+        if sources is not None:
+            if checkpoint is not None:
+                checkpoint()
+            values = {item.name: getattr(sources, item.name) for item in dataclass_fields(sources)}
+            values["roots"] = _copy_collections(snapshot.roots, immutable=True, checkpoint=checkpoint)
+            values["collection"] = getattr(snapshot, "collection", None)
+            return cls(**values)
+        values = {
+            item.name: getattr(snapshot, item.name, None) if item.name == "collection" else getattr(snapshot, item.name)
+            for item in dataclass_fields(cls)
+        }
+        # One memo covers aliases shared by the fact, field and tree indexes.
+        return cls(**_copy_collections(values, immutable=True, checkpoint=checkpoint))
+
+    def materialize(
+        self, *, read_only_sources: bool = False, checkpoint: Callable[[], object] | None = None
+    ) -> SnapshotFacts:
+        """Copy the editable display forest, sharing proven immutable sources.
+
+        The default remains a detached editable snapshot. Internal pure display
+        passes only edit roots: aliases, provenance, fields and native facts all
+        remain capture-owned read-only inputs rather than being recopied for
+        every preparation and rendering pass.
+        """
+        values = {
+            item.name: (
+                getattr(self, item.name)
+                if read_only_sources and item.name != "roots"
+                else _copy_collections(getattr(self, item.name), immutable=False, checkpoint=checkpoint)
+            )
+            for item in dataclass_fields(self)
+        }
         values["driver_features"] = self.driver_features
         return _MaterializedSnapshot(**values)
 
@@ -175,6 +286,10 @@ class PreparedRoot:
         source: Immutable source fields and original containment for provenance checks.
         provenance: Source facts contributing to composed display values.
         failure: Compression failure to describe when the final output is rendered.
+        interface: Source-bound reading blocks selected before delivery and text formatting.
+        disclosure: Exact passive fields whose full captured text is available in details.
+        atoms: Typed source-bound fields prepared before layout and terminal serialization.
+        readable: Source-bound field typography and numbered same-result native notes.
     """
 
     root_ref: str
@@ -183,19 +298,62 @@ class PreparedRoot:
     source: ProjectionInput | None = None
     provenance: Mapping[tuple[str, str], PresentedValue] | None = None
     failure: PreparationFailure | None = None
+    interface: InterfaceDocument | None = None
+    disclosure: DisclosurePlan | None = None
+    atoms: AtomDocument | None = None
+    collections: CollectionDocument | None = None
+    fields: FieldContentPlan | None = None
+    sharing: SharingPlan | None = None
+    coverage: CoveragePlan | None = None
+    text_slices: TextSliceDocument | None = None
+    groups: GroupDisclosurePlan | None = None
+    readable: ReadablePlan | None = None
 
     @classmethod
-    def capture(cls, root_ref: str, members: tuple[str, ...], projection: ProjectionResult) -> PreparedRoot:
+    def capture(
+        cls,
+        root_ref: str,
+        members: tuple[str, ...],
+        projection: ProjectionResult,
+        *,
+        interface: InterfaceDocument | None = None,
+        disclosure: DisclosurePlan | None = None,
+        atoms: AtomDocument | None = None,
+        collections: CollectionDocument | None = None,
+        fields: FieldContentPlan | None = None,
+        sharing: SharingPlan | None = None,
+        coverage: CoveragePlan | None = None,
+        text_slices: TextSliceDocument | None = None,
+        groups: GroupDisclosurePlan | None = None,
+        readable: ReadablePlan | None = None,
+        checkpoint: Callable[[], object] | None = None,
+    ) -> PreparedRoot:
         return cls(
-            root_ref, members, _copy_collections(projection, immutable=True), projection.source, projection.provenance
+            root_ref,
+            members,
+            _copy_collections(projection, immutable=True, checkpoint=checkpoint),
+            projection.source,
+            projection.provenance,
+            interface=interface,
+            disclosure=disclosure,
+            atoms=atoms,
+            collections=collections,
+            fields=fields,
+            sharing=sharing,
+            coverage=coverage,
+            text_slices=text_slices,
+            groups=groups,
+            readable=readable,
         )
 
-    def materialize(self) -> ProjectionResult:
+    def materialize(self, *, checkpoint: Callable[[], object] | None = None) -> ProjectionResult:
         """Copy the retained projection without repeating semantic or compression passes."""
         if self.projection is None or self.source is None:
             raise ValueError("An uncompressed branch has no display projection")
         return ProjectionResult(
-            _copy_collections(self.projection, immutable=False), self.source, dict(self.provenance or {})
+            _copy_collections(self.projection, immutable=False, checkpoint=checkpoint),
+            self.source,
+            _copy_collections(self.provenance or {}, immutable=False, checkpoint=checkpoint),
         )
 
 
@@ -275,32 +433,185 @@ class PreparedSnapshot:
         return tuple(sorted(refs))
 
 
-def prepared_nodes(roots: tuple[PreparedRoot, ...], snapshot: CapturedSnapshot) -> tuple[PreparedNode, ...]:
-    """Index display containment directly from prepared projections and fallback records."""
+def prepared_nodes(
+    roots: tuple[PreparedRoot, ...],
+    snapshot: CapturedSnapshot,
+    *,
+    defer_inactive_selections: bool = False,
+    checkpoint: Callable[[], object] | None = None,
+) -> tuple[PreparedNode, ...]:
+    """Index the fields and containment used to compare the final display.
+
+    Args:
+        roots: Frozen display projections, original atoms and source coverage.
+        snapshot: Unchanged captured facts and their original reference bindings.
+        defer_inactive_selections: Match the default compact delivery policy. A
+            complete unfocused collapsed range may be excluded from comparison
+            only when its exact atom claim is delivered through captured details.
+        checkpoint: Original call-budget check, consulted within bounded work batches.
+
+    Returns:
+        Ordered display-comparison nodes. Original projections, atoms, native
+        facts and the positions available through details remain unchanged.
+    """
+    if checkpoint is not None:
+        checkpoint()
+    work = 0
+
+    def checked(items):
+        nonlocal work
+        for item in items:
+            work += 1
+            if checkpoint is not None and work % 128 == 0:
+                checkpoint()
+            yield item
+
     result: list[PreparedNode] = []
-    native = {node["node"]: node for node in snapshot.facts["nodes"]}
+    native = {node["node"]: node for node in checked(snapshot.facts["nodes"])}
+    layouts = {}
+    for root in checked(roots):
+        if root.interface is not None:
+            signatures = interface_layout_signatures(root.interface, checkpoint=checkpoint)
+            layouts.update(checked(signatures.items()))
+    field_layouts = {}
+    group_layouts = {}
+    readable_layouts = {}
+    outside_window_fields: set[str] = set()
+    selections = (
+        selection_summary_plan(snapshot.facts, snapshot.refs, roots=snapshot.roots)
+        if defer_inactive_selections
+        else None
+    )
+    detail_selections: set[str] = set()
+
+    for root in checked(roots):
+        if root.source is not None:
+            outside_window_fields.update(root.source.outside_window_fields)
+        if root.atoms is not None and selections is not None:
+            for claim in checked(root.atoms.field_claims):
+                entry = selections.entries.get(claim.ref)
+                inactive_selection_claim = (
+                    bool(claim.kind == "text-selection-summary")
+                    and bool(claim.field == "selectionRange")
+                    and bool(claim.target == claim.ref)
+                )
+                inactive_selection_claim = inactive_selection_claim and entry is not None and bool(entry.inactive)
+                if (
+                    inactive_selection_claim
+                    and isinstance(claim.value, Mapping)
+                    and selections.covers(claim.ref, claim.value)
+                ):
+                    detail_selections.add(claim.ref)
+        if root.readable is not None:
+            for ref, style in checked(root.readable.nodes.items()):
+                readable_layouts[ref] = (
+                    (
+                        style.note_slots,
+                        style.block_slots,
+                        style.note_actions,
+                        style.toggle_slot,
+                        style.glyph,
+                        style.notes_only,
+                        style.visual_row,
+                    ),
+                    tuple(
+                        (
+                            key,
+                            heading.ref,
+                            (heading.caption.key, heading.caption.value) if heading.caption is not None else None,
+                            heading.sources,
+                            heading.shared_index,
+                            heading.transparent,
+                        )
+                        for key, heading in checked(root.readable.headings.items())
+                        if heading.ref == ref or ref in heading.sources
+                    ),
+                )
+        if root.groups is not None:
+            for group in checked(root.groups.groups):
+                signature = (
+                    group.kind,
+                    group.projected_refs,
+                    group.captured_records,
+                    tuple(
+                        (part.ref, part.slot_key, part.start, part.end) for part in checked((*group.head, *group.tail))
+                    ),
+                    tuple((entry.ref, entry.slot_key) for entry in checked(group.outline)),
+                )
+                if isinstance(group, BackgroundOverview):
+                    signature += (
+                        group.window_ref,
+                        group.blockers,
+                        group.directory_complete,
+                        group.important_refs,
+                        group.uncertain_refs,
+                        group.nested_windows,
+                        group.state_facts,
+                    )
+                group_layouts.update((ref, signature) for ref in checked(group.projected_refs))
+        if root.fields is not None:
+            for plan in checked(root.fields.fields.values()):
+                field_layouts[plan.target_ref] = tuple(
+                    (slot.key, slot.label, slot.value, slot.format, slot.placement)
+                    for slot in checked(plan.target_slots)
+                )
+                for member in checked(plan.members):
+                    field_layouts[member.ref] = (plan.target_ref, member.mode, member.consumed_slots)
+        # Table prefix sharing and packing only affect the full view. The
+        # terminal renderer retains complete, unshared atoms for each diff
+        # element, including row/column fields. A changed packing candidate must
+        # not mark every otherwise unchanged cell as modified.
 
     def visit(node: Mapping[str, Any], parent: str | None, depth: int) -> None:
-        result.append(
-            PreparedNode(
-                node["ref"],
-                parent,
-                depth,
-                freeze({key: value for key, value in node.items() if key not in ("children", "native")}),
-            )
-        )
-        for child in node["children"]:
+        fields = {key: value for key, value in checked(node.items()) if key not in ("children", "native")}
+        selection = fields.get("selectionRange")
+        if node["ref"] in detail_selections and isinstance(selection, Mapping) and selections is not None:
+            if selections.covers(node["ref"], selection):
+                fields.pop("selectionRange")
+        if node["ref"] in layouts:
+            fields["_interfaceLayout"] = layouts[node["ref"]]
+        if node["ref"] in field_layouts:
+            fields["_interfaceField"] = field_layouts[node["ref"]]
+        if node["ref"] in group_layouts:
+            fields["_interfaceDisclosure"] = group_layouts[node["ref"]]
+        if node["ref"] in readable_layouts:
+            fields["_interfaceReadable"] = readable_layouts[node["ref"]]
+        if node["ref"] in outside_window_fields:
+            fields["_boundsOutsideWindow"] = True
+        # _interfaceLayout is produced as a recursively immutable tuple of
+        # layout scalars/tuples. Recopying its shared ancestor path for every
+        # descendant adds no isolation. Other fields retain normal detachment.
+        layout = fields.pop("_interfaceLayout") if node["ref"] in layouts else None
+        captured_fields = _copy_collections(fields, immutable=True, checkpoint=checkpoint)
+        if layout is not None:
+            captured_fields = MappingProxyType({**captured_fields, "_interfaceLayout": layout})
+        result.append(PreparedNode(node["ref"], parent, depth, captured_fields))
+        for child in checked(node["children"]):
             visit(child, node["ref"], depth + 1)
 
-    for root in roots:
-        if root.projection is None:
-            for ref in root.members:
-                facts = display_node_facts(native[snapshot.refs[ref]])
-                result.append(PreparedNode(ref, None, 0, freeze(facts)))
-        else:
-            for node in root.projection["roots"]:
-                visit(node, None, 0)
-    return tuple(result)
+    try:
+        for root in checked(roots):
+            if root.projection is None:
+                for ref in checked(root.members):
+                    facts = {
+                        key: value for key, value in checked(display_node_facts(native[snapshot.refs[ref]]).items())
+                    }
+                    facts["_relations"] = tuple(
+                        relation
+                        for relation in checked(snapshot.facts["relations"])
+                        if relation["source"] == snapshot.refs[ref]
+                    )
+                    result.append(
+                        PreparedNode(ref, None, 0, _copy_collections(facts, immutable=True, checkpoint=checkpoint))
+                    )
+            else:
+                for node in checked(root.projection["roots"]):
+                    visit(node, None, 0)
+        return tuple(result)
+    finally:
+        # The self-referential closure also owns the full captured snapshot;
+        # stop retaining it as soon as this comparison traversal is complete.
+        visit = None
 
 
 def prepare_snapshot(

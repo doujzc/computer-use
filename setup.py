@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import platform
+import runpy
 import shutil
 import subprocess
 import sys
@@ -23,6 +24,16 @@ except ModuleNotFoundError:
     from wheel.bdist_wheel import bdist_wheel
 
 ROOT = Path(__file__).resolve().parent
+BACKENDS = runpy.run_path(str(ROOT / "scripts/backend_artifacts.py"))
+BACKEND_ARCHIVE = os.environ.get("COMPUTER_USE_BACKEND_ARCHIVE")
+BACKEND_DIR = os.environ.get("COMPUTER_USE_BACKEND_DIR")
+if BACKEND_ARCHIVE and BACKEND_DIR:
+    raise ValueError("Select one backend archive or one prepared backend directory.")
+if BACKEND_DIR:
+    CLOUD_BACKENDS = runpy.run_path(str(ROOT / "scripts/cloud_build/backend_artifact.py"))
+    PREPARED_BACKEND = CLOUD_BACKENDS["inspect_directory"](BACKEND_DIR)
+    if PREPARED_BACKEND["protocol"] != BACKENDS["protocol_version"](ROOT):
+        raise ValueError("Prepared backend protocol does not match this checkout.")
 
 # Public imports retain stable, unambiguous package names while the checkout
 # groups code by responsibility. Never scan the repository or native sources as
@@ -87,18 +98,6 @@ def native_platform():
     return None
 
 
-class NativeWheel(bdist_wheel):
-    def finalize_options(self):
-        self.native_platform = None if os.environ.get("COMPUTER_USE_BACKEND_DIR") else native_platform()
-        if self.native_platform is not None:
-            self.plat_name = self.native_platform
-        super().finalize_options()
-
-    def run(self):
-        self.distribution.get_command_obj("build_py").native_platform = self.native_platform
-        super().run()
-
-
 class BuildWithResources(build_py):
     native_platform = None
 
@@ -118,9 +117,8 @@ class BuildWithResources(build_py):
         super().run()
         output = resolved / "computer_use" / "_resources"
         output.mkdir(parents=True, exist_ok=True)
-        backend = os.environ.get("COMPUTER_USE_BACKEND_DIR")
-        if backend:
-            shutil.copytree(backend, output, dirs_exist_ok=True)
+        if BACKEND_DIR:
+            shutil.copytree(BACKEND_DIR, output, dirs_exist_ok=True)
             return
         resources = [ROOT / name for name in FILES]
         for directory in DIRECTORIES:
@@ -139,12 +137,18 @@ class BuildWithResources(build_py):
                         yield path
 
             resources.extend(_iter_path(iter(base.rglob("*")), base))
-        for source in sorted(set(resources)):
-            relative = source.relative_to(ROOT)
+        manifest = {}
+        for resource in sorted(set(resources)):
+            relative = resource.relative_to(ROOT)
             target = output / relative
             target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, target)
-        if self.native_platform:
+            shutil.copy2(resource, target)
+            manifest[relative.as_posix()] = hashlib.sha256(resource.read_bytes()).hexdigest()
+        if BACKEND_ARCHIVE:
+            backend = BACKENDS["unpack_archive"](BACKEND_ARCHIVE, output, root=ROOT)
+            for name in ["backend.json", *backend["files"]]:
+                manifest[name] = hashlib.sha256((output / name).read_bytes()).hexdigest()
+        elif self.native_platform:
             subprocess.run(
                 [
                     sys.executable, "-m", "computer_use_native_tools.native",
@@ -153,17 +157,36 @@ class BuildWithResources(build_py):
                 cwd=resolved,
                 check=True,
             )
-        manifest = {
-            path.relative_to(output).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
-            for path in sorted(output.rglob("*")) if path.is_file()
-        }
+            backend = json.loads((output / "backend.json").read_bytes())
+            for name in ["backend.json", *backend["files"]]:
+                manifest[name] = hashlib.sha256((output / name).read_bytes()).hexdigest()
         (output / "manifest.json").write_text(
             json.dumps(manifest, sort_keys=True, separators=(",", ":")), encoding="utf-8"
         )
 
 
+class BackendWheel(bdist_wheel):
+    def finalize_options(self):
+        self.native_platform = None if BACKEND_ARCHIVE or BACKEND_DIR else native_platform()
+        if self.native_platform is not None:
+            self.plat_name = self.native_platform
+        super().finalize_options()
+
+    def run(self):
+        self.distribution.get_command_obj("build_py").native_platform = self.native_platform
+        super().run()
+
+    def get_tag(self):
+        if BACKEND_DIR:
+            return "py3", "none", CLOUD_BACKENDS["WHEEL_PLATFORMS"][PREPARED_BACKEND["target"]]
+        if BACKEND_ARCHIVE:
+            backend = BACKENDS["inspect_archive"](BACKEND_ARCHIVE, root=ROOT)
+            return "py3", "none", BACKENDS["TARGETS"][backend["target"]][2]
+        return super().get_tag()
+
+
 setup(
     packages=discover_packages(),
     package_dir=PACKAGE_ROOTS,
-    cmdclass={"build_py": BuildWithResources, "bdist_wheel": NativeWheel},
+    cmdclass={"build_py": BuildWithResources, "bdist_wheel": BackendWheel},
 )

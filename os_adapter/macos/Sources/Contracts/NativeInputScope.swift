@@ -9,6 +9,14 @@ struct NativeInputScope {
     let window: AXUIElement?
     let menuRoot: AXUIElement?
     let blocked: [String]
+    struct WindowEvidence {
+        let windows: [NativeApplicationAccess.Window]
+        var nativeWindows: [NativeWindows.Window]? = nil
+        var coverageComplete = false
+    }
+    /// One query's result, never a catalogue cache. Qualified popup checks use
+    /// the same graph for fixed-root and original-owner modal boundaries.
+    var windowEvidence: WindowEvidence? = nil
 
     func requireWindow() throws -> AXUIElement {
         guard menuRoot == nil, let window else {

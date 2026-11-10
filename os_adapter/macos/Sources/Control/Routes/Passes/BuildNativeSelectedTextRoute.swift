@@ -30,11 +30,10 @@ import ApplicationServices
         if kind == "prepare_receiver" {
             return .prepare {
                 if foreground {
-                    try op.requireForegroundPreparation(
-                        id, hostAllowed: ForegroundAssist.enabled || BackgroundTarget.isExclusive)
+                    try op.requireForegroundPreparation(id)
                 }
                 try await unit.prepare(
-                    editContract, foreground: foreground, check: checkBoundary,
+                    editContract, text: text, foreground: foreground, check: checkBoundary,
                     onPreparation: receipt.recordPreparation, onCleanupUnknown: receipt.recordCleanupUnknown)
                 receipt.detail = "Native editor context confirmed; no text was sent."
                 receipt.confirmation = "confirmed"
@@ -56,7 +55,7 @@ import ApplicationServices
                 ? (intentKind == "replace"
                     ? "The complete target text is already empty; no replacement input was sent."
                     : "Empty text; no input was sent.")
-                : "Native selected-text edit dispatched; application effect unconfirmed."
+                : "Native selected-text edit dispatched."
             if alreadySatisfied { receipt.confirmation = "confirmed" }
             return alreadySatisfied
         }

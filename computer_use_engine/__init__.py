@@ -3,10 +3,16 @@
 
 """Computer Use SDK: public Python API and cross-platform desktop semantics."""
 
-from .client.computer import UI, App, Computer, Element, Window
+from .client.computer import App, Computer, Element
+from .client.targets import Target
 from .errors import ComputerUseError
 from .types import (
     ActionResult,
+    ActionImpact,
+    ActualInputImpact,
+    InputAttempt,
+    InputEffect,
+    PreparationImpact,
     AppInfo,
     Button,
     ClickOption,
@@ -15,14 +21,22 @@ from .types import (
     ElementPath,
     ElementSelector,
     Observation,
+    ObservationError,
     Point,
     TextPage,
     View,
+    WindowCatalogue,
+    WindowChoice,
+    WindowInfo,
 )
 
 __all__ = [
-    "UI",
     "ActionResult",
+    "ActionImpact",
+    "ActualInputImpact",
+    "InputAttempt",
+    "InputEffect",
+    "PreparationImpact",
     "App",
     "AppInfo",
     "Button",
@@ -35,10 +49,14 @@ __all__ = [
     "ElementPath",
     "ElementSelector",
     "Observation",
+    "ObservationError",
     "Point",
+    "Target",
     "TextPage",
     "View",
-    "Window",
+    "WindowCatalogue",
+    "WindowChoice",
+    "WindowInfo",
     "__version__",
 ]
 

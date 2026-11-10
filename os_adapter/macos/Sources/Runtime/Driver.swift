@@ -20,6 +20,7 @@ import CoreGraphics
         self.state = state
         state.sharing.onUserStop = { [weak self] in
             self?.state.pointer.stop()
+            self?.state.appObserver.stop()
             self?.requests.cancelActive()
         }
     }
@@ -122,32 +123,34 @@ import CoreGraphics
                 guard try string(raw["method"], label: "method") == "hello" else {
                     throw DriverError("id 0 is reserved for hello")
                 }
-                let params = try object(raw["params"], keys: ["desktopMode"])
-                let requestedMode = try string(params["desktopMode"], label: "desktopMode")
-                let mode = ProcessInfo.processInfo.environment["COMPUTER_USE_DESKTOP"] ?? "shared"
-                guard ["shared", "exclusive"].contains(mode), requestedMode == mode else {
-                    reply(
-                        id,
-                        failure(
-                            "mode_mismatch", detail: "requested desktop mode does not match the backend",
-                            next: "configure the SDK and backend for the same shared/exclusive mode"))
-                    return
-                }
+                let params = try object(raw["params"], keys: ["globalInputAllowed"])
+                let globalInputAllowed = try boolean(params["globalInputAllowed"], label: "globalInputAllowed")
+                state.configureInputAuthorization(globalInputAllowed: globalInputAllowed)
                 handshaken = true
                 reply(
                     id,
                     [
                         "result": [
-                            "platform": "macos", "desktopMode": mode, "maxTimeoutMs": 120_000,
+                            "platform": "macos", "globalInputAllowed": globalInputAllowed, "maxTimeoutMs": 120_000,
                             "capabilities": [
                                 "cancel", "requestDedup", "desktopCoordination", "nativeOperations",
-                                "nativeBoundContracts", "nativeUnitReadinessV2", "nativeClickPipelineV1",
-                                "nativeClickPipelineV2", "nativeDirectory", "nativeApplicationRoots",
-                                "nativeMenuActions", "nativeMenuShortcuts", "nativeCapture", "nativeCaptureKinds",
-                                "nativeDesktopInput", "nativeRelations", "nativeNodePages", "nativeNodeDepthBudget",
-                                "nativeRelationPages", "nativeCapturedText", "nativeRawNodeMetadata",
+                                "nativeInputActivityV1", "nativeBoundContracts", "nativeUnitReadinessV2",
+                                "nativeClickPipelineV1", "nativeClickPipelineV2", "nativeDirectory", "nativeApplicationPath",
+                                "nativeVisualSurfaceQuery", "nativeSurfaceBatch", "nativeVisualSurfaceBatch",
+                                "nativeApplicationListing", "nativeApplicationRoots", "nativeApplicationContent",
+                                "nativeApplicationLifetime", "nativeWindowCatalogue",
+                                "nativeMenuActions",
+                                "nativeMenuShortcuts", "nativeCapture", "nativeCaptureKinds", "nativeCaptureRetention",
+                                "nativeGlobalInput", "nativePointLocation",
+                                "nativeObservationPreparation",
+                                "nativeAppChangeEvents",
+                                "nativeQueryActionProfile", "nativeFocusedReadV1",
+                                "nativeRelations", "nativeNodePages", "nativeNodeDepthBudget", "nativeRelationPages",
+                                "nativeCapturedText", "nativeParameterizedText", "nativeRawNodeMetadata",
+                                "nativeAttributeCataloguePool",
                                 "nativeAXAttributeQueries", "nativeActionIntents", "nativeWindowScope",
-                                "nativeKeyboardIntents", "nativeTextInput", "nativeActuators", "nativeTextReplacement",
+                                "nativeKeyboardIntents", "nativeApplicationCommand", "nativeTextInput",
+                                "nativeActuators", "nativeTextReplacement",
                                 "nativeSelectedText", "nativeEditorPreparation", "nativePointer",
                                 "nativeElementPointer", "nativeElementScroll", "nativeSelectionBasis",
                                 "nativeControlParts", "nativeTableFacts", "nativeBusyFacts", "nativeVirtualFocus",
@@ -235,7 +238,7 @@ import CoreGraphics
     }
 
     private func perform(_ raw: [String: Any], id: Int64, deadline: TimeInterval) async {
-        let metrics = WindowGeometry.inputDiagnosticsEnabled ? NativeMetrics() : nil
+        let metrics = NativeMetrics()
         await RequestDiagnostics.$id.withValue(id) {
             await RequestDiagnostics.$metrics.withValue(metrics) {
                 await RequestDiagnostics.$deadline.withValue(deadline) {

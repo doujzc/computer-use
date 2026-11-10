@@ -23,7 +23,6 @@ _DESKTOP_ENV = (
     "XDG_SESSION_TYPE",
     "WAYLAND_DISPLAY",
     "COMPUTER_USE_PACKAGES_DIR",
-    "COMPUTER_USE_FOREGROUND_ASSIST",
 )
 
 
@@ -42,19 +41,24 @@ class McpConnection:
 
     async def start(self):
         if self._closed:
-            raise RuntimeError("Computer Use connection is closed; create a new toolkit.")
+            raise RuntimeError("Computer Use connection is closed.")
         if self._task is None:
             self._ready = asyncio.get_running_loop().create_future()
             self._task = asyncio.create_task(self._serve())
         await asyncio.shield(self._ready)
         if self._task.done():
             await self._task
-            raise RuntimeError("Computer Use connection ended; previous actions may have executed.")
+            raise RuntimeError("Computer Use connection ended.")
 
     async def _serve(self):
+        desktop_keys = _DESKTOP_ENV
+        if os.name == "nt" and not any(key.upper() == "PROGRAMDATA" for key in self.config.env):
+            # Windows environment names are case-insensitive. An explicit
+            # override owns this key regardless of its spelling.
+            desktop_keys += ("ProgramData",)
         environment = {
             **get_default_environment(),
-            **{key: os.environ[key] for key in _DESKTOP_ENV if key in os.environ},
+            **{key: os.environ[key] for key in desktop_keys if key in os.environ},
             **self.config.env,
         }
         params = StdioServerParameters(
@@ -77,7 +81,7 @@ class McpConnection:
                 self._ready.set_exception(error)
             elif not isinstance(error, asyncio.CancelledError):
                 logger.exception("Computer Use MCP connection ended")
-                raise RuntimeError("Computer Use MCP connection ended; previous actions may have executed.") from error
+                raise RuntimeError("Computer Use MCP connection ended.") from error
         finally:
             self.session = None
 

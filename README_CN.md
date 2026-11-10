@@ -7,7 +7,7 @@
 [English](README.md) | 简体中文
 
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-green.svg" alt="License" /></a>
-<img src="https://img.shields.io/badge/python-3.12%2B-blue.svg" alt="Python" />
+<img src="https://img.shields.io/badge/python-3.11%2B-blue.svg" alt="Python" />
 <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey.svg" alt="Platform" />
 
 </div>
@@ -18,7 +18,7 @@ Computer Use 是 openJiuwen 智能体系统服务层（Agent System Service）�
 
 开发者有两种形式可以接入使用：
 
-**方法 1：接入 computer_use 引擎。** 通过 MCP 连接智能体，或直接调用 Python SDK。MCP 工具 `computer_use(title, code)` 提供 `Computer → App / Window → Element` 接口，模型编写 Python 完成操作，变量跨调用保留。智能体结合无障碍树和截图定位控件，并读取界面验证操作结果。
+**方法 1：接入 computer_use 引擎。** 通过 MCP 连接智能体，或直接调用 Python SDK。MCP 工具 `computer_use(title, code)` 提供 `Computer → App → Element` 接口，模型编写 Python 完成操作，变量跨调用保留。智能体结合无障碍树和截图定位控件，并读取界面验证操作结果。
 
 **方法 2：接入 Computer Use DeepAgent。** 使用基于 openJiuwen DeepAgent 组装的电脑操作智能体，通过标准 `invoke()`、`stream()` 和 `Runner` 接口集成到应用中。应用向智能体传入自然语言任务，由智能体观察桌面、执行操作并核对结果。
 
@@ -56,15 +56,15 @@ flowchart TD
     OS --> Desktop["桌面应用"]
 ```
 
-DeepAgent 负责模型调用、对话上下文与工具循环；引擎维护 `Computer → App / Window → Element` 接口、目标身份、观察结果及操作选路；操作系统适配器负责解析原生对象、准备输入接收者并派发操作。智能体收到 `dispatched` 或 `verified` 回执后，通过再次读取界面确认任务效果。
+DeepAgent 负责模型调用、对话上下文与工具循环。引擎维护目标身份、观察结果及操作选路。操作系统适配器准备输入接收者并派发操作。
 
 ## 功能特性
 
 - **DeepAgent 接入**：支持 openJiuwen 标准调用、流式输出和 Runner 接入，电脑操作工具可复用于已有 DeepAgent 应用。
 - **单工具代码执行**：模型写 Python，变量跨调用保留，一次调用完成多步工作流。
 - **无障碍树优先**：元素按十进制 ref 编号，支持 `element(path)` 路径查询、文本分页读取、菜单读取。
-- **可核验回执**：每个动作返回 `dispatched` / `verified`，失败结构化为 `code / effect / next`。
-- **共享与独占两种桌面模式**：默认不抢前台，对后台窗口定向输入；可按需启用前台辅助。
+- **可核验回执**：派发结果与写后观察分别返回。观察默认展示 diff，截图通过显式读取获取。
+- **后台优先输入**：App 方法可用 `window=` 指定范围。macOS 的全局输入由 Computer 的直接输入方法触发。
 - **跨平台原生驱动**：macOS、Windows、Linux 各一套，协议一致。
 - **可观测**：每次执行写入 `~/.computer-use/logs` 的 JSONL 日志，含代码、观测与回执。
 
@@ -95,11 +95,11 @@ computer-use/
 
 - [MCP 构建、安装与接入](docs/mcp.md)
 - [DeepAgent 构建、安装与接入](docs/deepagent.md)
-
+- [开发打包说明](PACKAGING.md)
 - [DeepAgent 接入](computer_use_agent/agent.py)：Agent 构建、标准调用与会话生命周期。
 - [DeepAgent 工具](computer_use_agent/toolkit.py)：已有 openJiuwen 应用的工具接入。
-- [SDK 接口参考](computer_use_engine/__init__.pyi)：`Computer`、`App`、`Window`、`Element` 的公开接口与参数类型。
-- [MCP 服务入口](interface_adapter/mcp/server.py)：工具定义、执行说明与桌面模式参数。
+- [SDK 接口参考](computer_use_engine/__init__.pyi)：`Computer`、`App`、`Element` 的公开接口与参数类型。
+- [MCP 服务入口](interface_adapter/mcp/server.py)：工具定义、执行说明与全局输入授权参数。
 - [原生环境准备命令](scripts/native.py)：各平台构建、权限检查与 Linux 会话配置。
 - [直接对话](computer_use_agent/cli/main.py)：命令行选项与交互命令。
 

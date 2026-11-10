@@ -1,78 +1,42 @@
 # coding: utf-8
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 
-"""Discover public app instances using the existing native directory protocol."""
+"""Discover application scopes without expanding any window catalogue."""
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from computer_use.identity import FrozenRecord
 from computer_use.diagnostics import local_failure
-from computer_use.errors import ComputerUseError
-from computer_use.native.query.directory import surfaces_query
+from computer_use.identity import FrozenRecord
 from computer_use.session.interfaces import ApplicationEntry
 
-from .membership import roots
 
 if TYPE_CHECKING:
     from computer_use.interaction.read.acquisition.directory.service import NativeDirectory
-    from computer_use.protocol.records import NativeDirectory as DirectoryFacts
     from computer_use.session.interfaces import ApplicationReferences
+    from computer_use.session.windows import WindowReferences
     from computer_use.types import AppInfo
 
 
 class ApplicationDiscoveryPipeline:
-    """Publish selectable App instances from application and window catalogues.
+    """Publish application choices independently of AX/window discovery.
 
-    Running applications with discovered root windows expand into instance
-    choices; other applications retain an application-level entry. Each choice
-    receives a public reference used to construct its App handle.
-
-    Attributes:
-        directory: Native application/window directory service used for discovery.
-        references: Registry publishing each choice under a public application number.
+    The native application directory supplies installed/running identity. Window
+    catalogue discovery occurs when the selected App or desktop is observed.
     """
 
-    def __init__(self, directory: NativeDirectory, references: ApplicationReferences) -> None:
-        self.directory, self.references = directory, references
+    def __init__(
+        self, directory: NativeDirectory, references: ApplicationReferences, windows: WindowReferences
+    ) -> None:
+        self.directory, self.references, self.windows = directory, references, windows
 
     async def run(self) -> list[AppInfo]:
-        """Discover applications and allocate public integer references for their choices."""
-        directory = await self.directory.applications()
+        """Publish applications only; concrete windows have their own references."""
+        directory = await self.directory.applications(include_ended=True)
+        self.windows.retire_applications(directory["session"], directory.get("endedApplications", ()))
         result = []
         for application in directory["applications"]:
-            if application["isRunning"]:
-                try:
-                    # The pipeline shares retained bindings with their owning service.
-                    # pylint: disable-next=protected-access
-                    surfaces = await self.directory._query(
-                        surfaces_query(
-                            application["id"],
-                            accessibility=False,
-                            capabilities=self.directory.port.connection.capabilities,
-                        ),
-                        30000,
-                    )
-                except ComputerUseError as error:
-                    if error.effect != "none":
-                        raise
-                    surfaces = None
-                if "nativeReadIsolation" in self.directory.port.connection.capabilities and (
-                    surfaces is None or not surfaces["surfaces"]
-                ):
-                    # Some providers enumerate window identity through AX
-                    # when no native window catalogue is available. This is
-                    # still a directory query, never recursive tree capture.
-                    try:
-                        surfaces = await self.directory.surfaces(application["id"])
-                    except ComputerUseError as error:
-                        if error.effect != "none":
-                            raise
-                        surfaces = None
-                if surfaces is not None and roots(surfaces):
-                    result.extend(self.publish_choices(application["displayName"], surfaces))
-                    continue
             entry = ApplicationEntry(
                 directory["session"], application["id"], application["displayName"], application["isRunning"]
             )
@@ -84,28 +48,6 @@ class ApplicationDiscoveryPipeline:
         if not result and directory["stopReasons"]:
             raise local_failure(
                 "application discovery is incomplete: " + "; ".join(directory["stopReasons"]),
-                "retry discovery when the desktop is available",
                 "observation_incomplete",
             )
         return result
-
-    def publish_choices(self, name: str, directory: DirectoryFacts) -> list[AppInfo]:
-        """Publish one App choice per root window in an application's directory.
-
-        Args:
-            name: Application display name used as the choice's title prefix.
-            directory: Native window catalogue, including parent-relationship evidence.
-
-        Returns:
-            Public entries with instance references and window-specific display names.
-        """
-        choices = []
-        for item in roots(directory):
-            title = name + (" — " + item["title"] if item["title"] else "")
-            if item["parentState"] == "unknown":
-                title += " [window ownership unknown]"
-            entry = ApplicationEntry(
-                directory["session"], directory["application"], title, True, directory, item["window"], name
-            )
-            choices.append(FrozenRecord(dict(id=self.references.publish(entry), display_name=title, is_running=True)))
-        return choices

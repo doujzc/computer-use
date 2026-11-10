@@ -14,10 +14,13 @@ import subprocess
 import sys
 import uuid
 from collections.abc import Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 
 from computer_use.diagnostics import SDK_VERSION, diagnostic, local_failure
 from computer_use.errors import ComputerUseError
+from computer_use.native import driver_exec
 from computer_use.native.preview import get_preview_handler, read_previews
 from computer_use.paths import native_driver
 from computer_use.protocol.captures import capture_metadata
@@ -26,6 +29,8 @@ from computer_use.protocol.execution import (
     decode_capture_request,
     decode_execution_result,
     decode_inspect_query,
+    decode_observation_preparation_request,
+    decode_point_location_request,
     decode_unit_command,
 )
 from computer_use.protocol.primitives import finite, record, safe_integer, trim
@@ -33,9 +38,9 @@ from computer_use.protocol.session import (
     NATIVE_PROTOCOL_VERSION,
     decode_failure,
     decode_hello,
-    desktop_mode,
     failure_error,
 )
+from computer_use.runtime_provenance import startup_provenance
 
 requestCleanupGraceMs, driverTerminationGraceMs = 750, 1000
 
@@ -56,21 +61,25 @@ def _now():
 
 
 class Connection:
-    def __init__(self, invalidate, driver=None, *, protocol_version=NATIVE_PROTOCOL_VERSION):
+    def __init__(self, invalidate, driver=None, *, protocol_version=NATIVE_PROTOCOL_VERSION, allow_global_input=True):
         # Exact types preserve scalar validation and identity contracts.
         # pylint: disable-next=unidiomatic-typecheck
         if type(protocol_version) is not int or protocol_version != NATIVE_PROTOCOL_VERSION:
             raise ValueError("Unsupported native protocol version")
         self.protocol_version = protocol_version
+        if allow_global_input is not True and allow_global_input is not False:
+            raise TypeError("allow_global_input must be a bool")
+        self.allow_global_input = allow_global_input
         self.invalidate, self.driver = invalidate, driver
         self._child = self._pending = self._hello = self._handshake = self._retiring = None
-        self._buffer = b""
+        self._buffer: bytearray = bytearray()
         self._requesting = self._waiting_for_exit = False
         self._next_id, self._generation = 1, 0
         self._diagnostic = ""
         self._traces, self._readers = {}, set()
         self._preview_transport = None
         self._child_uses_eof = False
+        self._retained_session = ContextVar("computer_use_retained_native_session", default=None)
 
     @property
     def session(self):
@@ -89,6 +98,37 @@ class Connection:
         "An internal lease cannot migrate across process retirement/reconnect."
         return (self._generation, self.session) if self._hello is not None else None
 
+    @contextmanager
+    def retain_session(self, identity):
+        """Keep optional follow-up requests on one existing driver generation.
+
+        This task-local scope does not own or reconnect the driver. Ordinary
+        reads outside it keep their existing connection behavior.
+        """
+        previous = self._retained_session.get()
+        if identity is None or previous is not None and previous != identity:
+            raise local_failure(
+                "the original native session is unavailable for this observation",
+                "stale_target",
+                "connection",
+            )
+        token = self._retained_session.set(identity)
+        try:
+            self._check_retained_session()
+            yield
+        finally:
+            self._retained_session.reset(token)
+
+    def _check_retained_session(self):
+        expected = self._retained_session.get()
+        if expected is not None and (self.session_identity != expected or self._child is None):
+            raise local_failure(
+                "the original native session ended during the related observation; "
+                "no replacement driver was started by this observation",
+                "stale_target",
+                "connection",
+            )
+
     def _track(self, coroutine):
         task = asyncio.create_task(coroutine)
         self._readers.add(task)
@@ -96,13 +136,13 @@ class Connection:
         return task
 
     async def _connect(self):
+        self._check_retained_session()
         if self._child is not None:
             return
         if self.driver is None and sys.platform not in ("darwin", "linux", "win32"):
             raise local_failure(
                 f"platform {sys.platform} is not implemented",
-                "run the MCP server on a supported system with its matching backend",
-                "mode_unsupported",
+                "unsupported_operation",
                 "connection",
             )
         driver = self.driver if self.driver is not None else native_driver()
@@ -110,11 +150,10 @@ class Connection:
         if self.driver is None and not Path(command).exists():
             raise local_failure(
                 f"{sys.platform} driver missing",
-                "build the native driver on the MCP host, then read the App again",
                 "execution_failed",
                 "connection",
             )
-        self._buffer, self._diagnostic, self._next_id = b"", "", 1
+        self._buffer, self._diagnostic, self._next_id = bytearray(), "", 1
         self._traces = {}
         windows = sys.platform == "win32"
         # Windows uses native stdio handles. The POSIX 3/4 descriptor bridge
@@ -124,6 +163,7 @@ class Connection:
         lifetime = 4 if os.environ.get("COMPUTER_USE_LIFETIME_FD") == "4" else -1
         if preview is not None:
             read_fd, write_fd = os.pipe()
+        provenance = startup_provenance(command)
         try:
             env = dict(os.environ)
             if windows:
@@ -135,8 +175,7 @@ class Connection:
                 env["COMPUTER_USE_PREVIEW_FD"] = "3" if preview is not None else ""
                 program = [
                     sys.executable,
-                    "-m",
-                    "computer_use.native.driver_exec",
+                    driver_exec.__file__,
                     str(write_fd),
                     str(lifetime),
                     command,
@@ -172,9 +211,10 @@ class Connection:
                 kind="connection",
                 sdkVersion=SDK_VERSION,
                 platform=sys.platform,
-                desktopMode=os.environ.get("COMPUTER_USE_DESKTOP", "shared"),
+                globalInputAllowed=self.allow_global_input,
                 executable=command,
                 pid=child.pid,
+                runtime=provenance,
             )
         )
         atexit.register(self._on_exit)
@@ -267,7 +307,7 @@ class Connection:
 
     async def request(self, method, params, options=None):
         if self._requesting:
-            raise local_failure("another system call is in progress", "await it before starting the next")
+            raise local_failure("another system call is in progress")
         self._requesting = True
         try:
             return await self._request(method, params, options.get("timeoutMs") if options is not None else None)
@@ -286,50 +326,61 @@ class Connection:
     async def _negotiate(self, timeout_ms):
         if self._hello is not None:
             return
-        mode, loop = desktop_mode(), asyncio.get_running_loop()
+        loop = asyncio.get_running_loop()
         future = loop.create_future()
         timer = loop.call_later(
             timeout_ms / 1000, lambda: self.close(RuntimeError("protocol hello timed out; no system command was sent"))
         )
         self._handshake = dict(future=future, timer=timer)
-        self._write(dict(version=self.protocol_version, id=0, method="hello", params=dict(desktopMode=mode)))
+        self._write(
+            dict(
+                version=self.protocol_version,
+                id=0,
+                method="hello",
+                params=dict(globalInputAllowed=self.allow_global_input),
+            )
+        )
         # This future belongs to the caller. Cancellation closes the whole
         # connection; only driver retirement is independent cleanup work.
         await future
 
     async def _request(self, method, params, budget):
-        if method not in (None, "begin", "inspect", "execute", "finish", "capture"):
-            raise local_failure(
-                "unsupported native protocol-6 method", "use the native operation protocol", "invalid_request", method
-            )
+        if method not in (
+            None, "begin", "inspect", "execute", "finish", "capture", "prepareObservation", "locatePoint"
+        ):
+            raise local_failure("unsupported native protocol-6 method", "invalid_request", method)
         if self._pending is not None or self._waiting_for_exit:
-            raise local_failure("another system call is in progress", "await it before starting the next")
+            raise local_failure("another system call is in progress")
         if method == "begin":
             try:
                 params = decode_begin(params)
             except (TypeError, ValueError) as error:
-                raise local_failure(
-                    str(error), "correct the native operation intent", "invalid_request", method
-                ) from error
+                raise local_failure(str(error), "invalid_request", method) from error
         if method == "inspect":
             try:
                 params = {**params, "query": decode_inspect_query(params.get("query"))}
             except (TypeError, ValueError) as error:
-                raise local_failure(
-                    str(error), "correct the native inspection request", "invalid_request", method
-                ) from error
+                raise local_failure(str(error), "invalid_request", method) from error
         if method == "capture":
             try:
                 params = decode_capture_request(params)
             except (TypeError, ValueError) as error:
-                raise local_failure(
-                    str(error), "correct the native capture scope or budget", "invalid_request", method
-                ) from error
+                raise local_failure(str(error), "invalid_request", method) from error
+        if method == "prepareObservation":
+            try:
+                params = decode_observation_preparation_request(params)
+            except (TypeError, ValueError) as error:
+                raise local_failure(str(error), "invalid_request", method) from error
+        if method == "locatePoint":
+            try:
+                params = decode_point_location_request(params)
+            except (TypeError, ValueError) as error:
+                raise local_failure(str(error), "invalid_request", method) from error
         if method == "execute":
             try:
                 params = {**params, "command": decode_unit_command(params.get("command"))}
             except (TypeError, ValueError) as error:
-                raise local_failure(str(error), "correct the native unit command", "invalid_request", method) from error
+                raise local_failure(str(error), "invalid_request", method) from error
         deadline = _now() + max(
             1,
             min(
@@ -343,12 +394,12 @@ class Connection:
             if value < 1:
                 raise local_failure(
                     "request budget exhausted before dispatch; no system command was sent",
-                    "read the target again when ready",
                     "execution_failed",
                     "connection",
                 )
             return value
 
+        self._check_retained_session()
         if self._retiring is not None:
             self._waiting_for_exit = True
             generation = self._generation
@@ -358,21 +409,22 @@ class Connection:
                 except TimeoutError:
                     raise local_failure(
                         "previous driver is still stopping",
-                        "wait for it to exit before reading the app again; no replacement driver was started",
                         "execution_failed",
                         "connection",
                     ) from None
                 if generation != self._generation:
                     raise local_failure(
                         "connection closed before the request started",
-                        "read the app again when ready",
                         "execution_failed",
                         "connection",
                     )
             finally:
                 self._waiting_for_exit = False
+        # Retirement can finish after an await and change the generation. Keep
+        # this refusal outside the connect-error close path: it must not retire
+        # an unrelated successor that another scope has already established.
+        self._check_retained_session()
         try:
-            desktop_mode()
             remaining()
             await self._connect()
             await self._negotiate(remaining())
@@ -389,7 +441,6 @@ class Connection:
                         effect="none",
                         target=method or "connection",
                         detail=str(error),
-                        next="check the backend configuration and connect again; no system command was sent",
                     ),
                     cause=error,
                 )
@@ -402,13 +453,17 @@ class Connection:
             remaining()
             return dict(self._hello)
         if not safe_integer(self._next_id):
-            error = local_failure(
-                "request id space exhausted", "read the app in a new session", "execution_failed", method
-            )
+            error = local_failure("request id space exhausted", "execution_failed", method)
             self.close(error)
             raise error
         capability = (
-            "nativeApplicationRoots"
+            "nativePointLocation"
+            if method == "locatePoint"
+            else "nativeGlobalInput"
+            if method == "begin" and params.get("target", {}).get("global") is True
+            else "nativeApplicationContent"
+            if method == "inspect" and params.get("query", {}).get("applicationContent") is True
+            else "nativeApplicationRoots"
             if method == "inspect" and params.get("query", {}).get("kind") == "roots"
             else "nativeRelationPages"
             if method == "inspect" and "relationPage" in params.get("query", {})
@@ -420,13 +475,17 @@ class Connection:
             if method == "inspect" and params.get("query", {}).get("kind") == "relation"
             else "nativeCapture"
             if method == "capture"
+            else "nativeObservationPreparation"
+            if method == "prepareObservation"
             else "nativeOperations"
         )
         if capability is not None and capability not in self._hello["capabilities"]:
+            detail = f"backend does not provide {capability} in this desktop session"
+            if capability == "nativeGlobalInput" and self._hello["platform"] == "windows":
+                detail += ". Rebuild the Windows driver with uv run --no-dev computer-use-build"
             raise local_failure(
-                f"backend does not provide {capability} in this desktop session",
-                ("use supported native elements, or connect a desktop with the required capture/input capabilities"),
-                "mode_unsupported",
+                detail,
+                "unsupported_operation",
                 method,
             )
         if (
@@ -436,28 +495,30 @@ class Connection:
         ):
             raise local_failure(
                 "backend does not provide nativeFollowRelations",
-                "rebuild the driver before requesting additional relationship collection",
-                "mode_unsupported",
+                "unsupported_operation",
                 method,
             )
         if method == "capture" and "nativeCaptureKinds" not in self._hello["capabilities"]:
             raise local_failure(
                 "backend does not provide nativeCaptureKinds",
-                "rebuild the driver before using explicit native capture scopes",
-                "mode_unsupported",
+                "unsupported_operation",
                 method,
             )
+        raw_global = (
+            params.get("target", {}).get("global") is True
+            or params.get("command", {}).get("kind") == "global_input"
+        )
         missing_bound_contracts = (
             True
             if (method == "begin" and params.get("mode") == "write" or method == "execute")
             and "nativeBoundContracts" not in self._hello["capabilities"]
+            and not raw_global
             else False
         )
         if missing_bound_contracts:
             raise local_failure(
                 "backend does not provide nativeBoundContracts",
-                "rebuild the native driver before using the contract-bound execution protocol",
-                "mode_unsupported",
+                "unsupported_operation",
                 method,
             )
         missing_unit_readiness = (
@@ -469,13 +530,13 @@ class Connection:
                 and params.get("query", {}).get("kind") in ("inputContext", "launch")
             )
             and "nativeUnitReadinessV2" not in self._hello["capabilities"]
+            and not raw_global
             else False
         )
         if missing_unit_readiness:
             raise local_failure(
                 "backend does not provide nativeUnitReadinessV2",
-                "rebuild the driver before using per-unit execution readiness",
-                "mode_unsupported",
+                "unsupported_operation",
                 method,
             )
         missing_launch_support = (
@@ -494,8 +555,7 @@ class Connection:
         if missing_launch_support:
             raise local_failure(
                 "backend does not provide nativeLaunch",
-                "rebuild the native driver before launching through the execution pipeline",
-                "mode_unsupported",
+                "unsupported_operation",
                 method,
             )
         missing_action_intents = (
@@ -505,36 +565,28 @@ class Connection:
                 and params.get("intent", {}).get("kind") in ("click", "openMenu")
                 and params.get("target", {}).get("capture") is None
                 and "nativeActionIntents" not in self._hello["capabilities"]
+                and not raw_global
             )
             else False
         )
         if missing_action_intents:
             raise local_failure(
                 "backend does not provide nativeActionIntents",
-                "update the native driver before using this execution route",
-                "mode_unsupported",
+                "unsupported_operation",
                 method,
             )
-        if (
-            method == "begin"
-            and params.get("intent", {}).get("kind") in ("focus", "key")
-            and "nativeKeyboardIntents" not in self._hello["capabilities"]
-        ):
+        keyboard_intent = method == "begin" and params.get("intent", {}).get("kind") in ("focus", "key")
+        if keyboard_intent and "nativeKeyboardIntents" not in self._hello["capabilities"] and not raw_global:
             raise local_failure(
                 "backend does not provide nativeKeyboardIntents",
-                "update the native driver before preparing or sending keys",
-                "mode_unsupported",
+                "unsupported_operation",
                 method,
             )
-        if (
-            method == "begin"
-            and params.get("intent", {}).get("kind") in ("insert", "paste")
-            and "nativeTextInput" not in self._hello["capabilities"]
-        ):
+        text_intent = method == "begin" and params.get("intent", {}).get("kind") in ("insert", "paste")
+        if text_intent and "nativeTextInput" not in self._hello["capabilities"] and not raw_global:
             raise local_failure(
                 "backend does not provide nativeTextInput",
-                "update the native driver before inserting or pasting text",
-                "mode_unsupported",
+                "unsupported_operation",
                 method,
             )
         missing_window_scope = (
@@ -551,8 +603,7 @@ class Connection:
         if missing_window_scope:
             raise local_failure(
                 "backend does not provide nativeWindowScope",
-                "update the driver before resolving a target inside a native operation",
-                "mode_unsupported",
+                "unsupported_operation",
                 method,
             )
         if (
@@ -562,8 +613,7 @@ class Connection:
         ):
             raise local_failure(
                 "backend does not provide nativeWindowScope",
-                "update the driver before binding logical target constraints",
-                "mode_unsupported",
+                "unsupported_operation",
                 method,
             )
         missing_native_actuators = (
@@ -579,8 +629,7 @@ class Connection:
         if missing_native_actuators:
             raise local_failure(
                 "backend does not provide nativeActuators",
-                "update the driver before selecting an internal editor",
-                "mode_unsupported",
+                "unsupported_operation",
                 method,
             )
         if (
@@ -590,8 +639,7 @@ class Connection:
         ):
             raise local_failure(
                 "backend does not provide nativeScroll",
-                "update the driver before selecting native page scrolling",
-                "mode_unsupported",
+                "unsupported_operation",
                 method,
             )
         if (
@@ -601,8 +649,7 @@ class Connection:
         ):
             raise local_failure(
                 "backend does not provide native scrolling",
-                "update the driver before executing native scrolling",
-                "mode_unsupported",
+                "unsupported_operation",
                 method,
             )
         if (
@@ -612,8 +659,7 @@ class Connection:
         ):
             raise local_failure(
                 "backend does not provide nativeElementScroll",
-                "update the driver before selecting an element wheel route",
-                "mode_unsupported",
+                "unsupported_operation",
                 method,
             )
         if (
@@ -623,8 +669,7 @@ class Connection:
         ):
             raise local_failure(
                 "backend does not provide nativeScrollContentPath",
-                "update the driver before selecting moving scroll content",
-                "mode_unsupported",
+                "unsupported_operation",
                 method,
             )
         if method == "begin" and params.get("mode") == "write" and params.get("target", {}).get("capture") is not None:
@@ -632,8 +677,7 @@ class Connection:
             if capability not in self._hello["capabilities"]:
                 raise local_failure(
                     "backend does not provide " + capability,
-                    "update the driver before using this observed input scope",
-                    "mode_unsupported",
+                    "unsupported_operation",
                     method,
                 )
         id__value, trace_id = self._next_id, str(uuid.uuid4())
@@ -658,7 +702,13 @@ class Connection:
         )
         loop = asyncio.get_running_loop()
         future = loop.create_future()
-        pure = method == "capture" or method == "inspect" and params.get("query", {}).get("kind") == "capturedText"
+        # These queries can leave an admitted lease unconfirmed without
+        # sending input. The write pipeline retains earlier effects.
+        pure = method in ("capture", "locatePoint") or (
+            method == "inspect" and params["query"]["kind"] in ("capturedText", "inputContext", "surfaces")
+        )
+        # macOS begin may acquire resources, but the requested action needs the returned token.
+        write_admission = method == "begin" and params["mode"] == "write" and self.platform == "macos"
         pending = dict(
             id=id__value,
             method=method,
@@ -668,6 +718,7 @@ class Connection:
             cancelSent=False,
             startedAt=_now(),
             pure=pure,
+            writeAdmission=write_admission,
         )
 
         def timeout():
@@ -720,11 +771,15 @@ class Connection:
             self.close(RuntimeError("host cancelled the request"))
             raise
 
-    def _receive(self, data):
+    def _receive(self, data: bytes) -> None:
         try:
-            self._buffer += data
+            self._buffer.extend(data)
             if len(self._buffer) > 64 * 1024 * 1024:
                 raise ValueError("protocol: response frame too large")
+            # Earlier chunks contain no terminator. Inspect only the new bytes
+            # until a complete line arrives, then decode the retained frame once.
+            if b"\n" not in data:
+                return
             while b"\n" in self._buffer:
                 line, self._buffer = self._buffer.split(b"\n", 1)
                 if line.endswith(b"\r"):
@@ -735,21 +790,22 @@ class Connection:
                 def invalid_constant(value):
                     raise ValueError("protocol: invalid JSON constant " + value)
 
+                json_started = _now()
                 value = json.loads(line.decode("utf-8", errors="strict"), parse_constant=invalid_constant)
+                json_decoded = _now()
                 if not isinstance(value, dict):
                     raise ValueError("protocol: expected response object")
                 if self._handshake is not None:
                     if self._buffer:
                         raise ValueError("protocol: unsolicited data after hello")
-                    self._hello = decode_hello(value, desktop_mode(), self.protocol_version)
+                    self._hello = decode_hello(value, self.allow_global_input, self.protocol_version)
                     if (
                         os.environ.get("COMPUTER_USE_DEMO_FOREGROUND") == "1"
                         and "demoForeground" not in self._hello["capabilities"]
                     ):
                         raise local_failure(
                             "demoForeground is not supported by this native backend",
-                            "rebuild the backend on the MCP host or disable demoForeground",
-                            "mode_unsupported",
+                            "unsupported_operation",
                             "connection",
                         )
                     handshake, self._handshake = self._handshake, None
@@ -781,17 +837,16 @@ class Connection:
                     failure = decode_failure(response["error"])
                     error = failure_error(pending["method"], failure)
                 else:
-                    result = decode_execution_result(pending["method"], response["result"])
+                    result = decode_execution_result(pending["method"], response["result"], retain_observation=True)
+                protocol_decoded = _now()
                 desktop_capture = (
                     pending["method"] == "capture" and result is not None and result.get("kind") == "desktopCapture"
                 )
-                if (
-                    desktop_capture
-                    and result is not None
-                    and result["observation"]["mode"] != self._hello["desktopMode"]
-                ):
-                    raise ValueError("protocol: desktop observation mode differs from the negotiated session")
                 summary = result
+                from computer_use.protocol.observation.adapters.wire import DecodedDriverObservation
+
+                if isinstance(result, DecodedDriverObservation):
+                    summary = result.wire.raw
                 if desktop_capture and result is not None:
                     summary = {
                         **result,
@@ -801,6 +856,7 @@ class Connection:
                     }
                 elif pending["method"] == "capture" and result is not None:
                     summary = {**result, "image": dict(source="window", **(capture_metadata(result["image"]) or {}))}
+                diagnostic_started = _now()
                 diagnostic(
                     dict(
                         kind="command_end",
@@ -815,6 +871,19 @@ class Connection:
                             if error is not None
                             else dict(result=summary)
                         ),
+                    )
+                )
+                diagnostic_elapsed = _now() - diagnostic_started
+                diagnostic(
+                    dict(
+                        kind="command_diagnostic_end",
+                        traceId=pending["traceId"],
+                        id=pending["id"],
+                        method=pending["method"],
+                        diagnosticMs=diagnostic_elapsed,
+                        jsonDecodeMs=json_decoded - json_started,
+                        protocolDecodeMs=protocol_decoded - json_decoded,
+                        frameBytes=len(line),
                     )
                 )
                 pending["timer"].cancel()
@@ -863,7 +932,6 @@ class Connection:
                         target="hello",
                         effect="none",
                         detail=f"{error}; no system command was sent; hello did not complete",
-                        next="check the backend configuration before connecting again",
                     ),
                     cause=error,
                 )
@@ -873,20 +941,24 @@ class Connection:
         self._pending = None
         if pending_value is not None:
             pure, target = pending_value["pure"], pending_value["target"] or {}
+            write_admission = pending_value["writeAdmission"]
+            no_action = pure or write_admission
+            if write_admission:
+                reason = "requested action was not dispatched; native operation admission unconfirmed"
+            else:
+                reason = "read-only request failed" if pure else "command may have partially executed"
             failure = ComputerUseError(
                 dict(
-                    code="execution_failed" if pure else "execution_unknown",
-                    effect="none" if pure else "possible",
+                    code="execution_failed" if no_action else "execution_unknown",
+                    effect="none" if no_action else "possible",
                     target=target.get("selector", target.get("screen", pending_value["method"])),
-                    detail=(
-                        f"{error}; {'read-only request failed' if pure else 'command may have partially executed'}"
-                        f"; current observation invalidated"
-                    ),
-                    next="reconnect by reading the target; inspect its state before retrying an action",
+                    detail=f"{error}; {reason}; current observation invalidated",
                 ),
                 cause=error,
                 method=pending_value["method"],
             )
+            if write_admission:
+                failure.scope_cleanup = "unknown"
             diagnostic(
                 dict(
                     kind="command_end",
@@ -898,14 +970,14 @@ class Connection:
                     status="error",
                     stage="connection",
                     error=str(failure),
-                    failure={key: getattr(failure, key) for key in ("code", "effect", "target", "detail", "next")},
+                    failure={key: getattr(failure, key) for key in ("code", "effect", "target", "detail")},
                 )
             )
             pending_value["timer"].cancel()
             if not pending_value["future"].done():
                 pending_value["future"].set_exception(failure)
         self.invalidate()
-        self._buffer = b""
+        self._buffer = bytearray()
         atexit.unregister(self._on_exit)
         if self._preview_transport is not None:
             self._preview_transport.close()

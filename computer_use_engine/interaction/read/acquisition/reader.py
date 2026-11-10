@@ -18,6 +18,7 @@ from computer_use.interaction.read.acquisition.text.model import CapturedTextReq
 from computer_use.interaction.read.acquisition.text.pipeline import CapturedTextPipeline
 from computer_use.interaction.read.numbering.references import DisplayReferences
 from computer_use.pipeline import Control
+from computer_use.protocol.records import relation_end
 
 if TYPE_CHECKING:
     from typing import Mapping
@@ -85,9 +86,7 @@ def captured_children(
     relation = relations.get(token)
     if relation is None or relation["certainty"] != "confirmed" or "cursor" not in relation:
         return None
-    return ChildContinuation(
-        relation["cursor"], relation.get("offset", 0) + len(relation["targets"]), relation["total"]
-    )
+    return ChildContinuation(relation["cursor"], relation_end(relation), relation["total"])
 
 
 def captured_field(
@@ -205,6 +204,7 @@ class NativeReader:
         children_page: RelationPage | None = None,
         relation_page: RelationPage | None = None,
         scope_kind: str | None = None,
+        strict_window: bool = False,
         _control: Control | None = None,
     ) -> SemanticSnapshot:
         self.validate(target, max_nodes, max_depth)
@@ -217,6 +217,7 @@ class NativeReader:
                 children_page=children_page,
                 relation_page=relation_page,
                 scope_kind=scope_kind,
+                strict_window=strict_window,
                 _control=_control,
             )
 
@@ -235,10 +236,20 @@ class NativeReader:
         children_page: RelationPage | None = None,
         relation_page: RelationPage | None = None,
         scope_kind: str | None = None,
+        query_remaining: Remaining | None = None,
+        strict_window: bool = False,
         _control: Control | None = None,
     ) -> SemanticSnapshot:
-        """Collect inside an existing node or window read operation."""
-        request = FactReadRequest(read, node, fields, max_nodes, max_depth, children_page, relation_page, scope_kind)
+        """Collect inside an existing node or window read operation.
+
+        A narrower query allowance limits the native request. Normalization
+        preserves facts already collected; later queries still use the lease's
+        original deadline.
+        """
+        request = FactReadRequest(
+            read, node, fields, max_nodes, max_depth, children_page, relation_page, scope_kind, query_remaining,
+            strict_window,
+        )
         control = scope_control(self.port, read.remaining, _control or Control())
         return await FactCollectionPipeline(self).arun(request, control)
 

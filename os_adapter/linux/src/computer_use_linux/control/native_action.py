@@ -10,6 +10,7 @@ persistent action identities. Resolve the exact declared name again at dispatch.
 from copy import deepcopy
 
 from computer_use_linux.contracts.protocol import Failure, fields, integer, require, string
+from computer_use_linux.control.action.support import action_matches
 from computer_use_linux.control.native_target import NativeTarget
 
 
@@ -25,7 +26,7 @@ def action_intent(value):
         require(
             p.get("button", "left") == "left" and p.get("count", 1) == 1,
             "This native action unit does not synthesize pointer clicks.",
-            "mode_unsupported",
+            "unsupported_operation",
         )
     elif kind == "action":
         p = fields(value["parameters"], ("action",))
@@ -33,24 +34,8 @@ def action_intent(value):
     elif kind == "openMenu":
         fields(value["parameters"], ())
     else:
-        raise Failure("This Linux v5 driver does not implement this input intent.", "mode_unsupported")
+        raise Failure("This Linux v5 driver does not implement this input intent.", "unsupported_operation")
     return deepcopy(value)
-
-
-def action_matches(catalogue, selected):
-    """Exact native identity, including description when it was observed.
-
-    Names may be duplicated by a provider. An explicit unique description can
-    distinguish them; an unread description cannot be assumed to differ.
-    """
-    if catalogue["state"] != "complete":
-        return []
-    matches = [(i, a) for i, a in enumerate(catalogue["items"]) if a["name"] == selected["name"]]
-    if "description" in selected:
-        if any(a.get("descriptionStatus", {}).get("state") not in (None, "absent") for _, a in matches):
-            return []
-        matches = [(i, a) for i, a in matches if a.get("description") == selected["description"]]
-    return [i for i, _ in matches]
 
 
 class NativeAction:
@@ -64,9 +49,18 @@ class NativeAction:
         return NativeActionPipeline(self.ax, self.target, self.facts).run(operation, command, ctx)
 
     def inspect(self, operation, target, within, ctx):
-        obj, _, _, role, enabled = self.target.read(target, within, ctx)
+        explicit = operation.intent["kind"] == "action"
+        obj, _, _, role, enabled = self.target.read(target, within, ctx, include_role=not explicit)
         operation.bind(target, within, self.store)
-        catalogue = self.facts.action_catalogue(obj, ctx)
+        # Named requests need the complete machine-readable name catalogue,
+        # not optional localized descriptions of unrelated actions.
+        catalogue = self.facts.action_catalogue(obj, ctx, descriptions=not explicit)
+        match_by = "name"
+        if explicit and catalogue["state"] == "complete":
+            requested = operation.intent["parameters"]["action"]
+            if not any(action["name"] == requested for action in catalogue["items"]):
+                match_by = "description"
+                catalogue = self.facts.action_descriptions(obj, catalogue)
         complete = catalogue["state"] == "complete"
         primitives = []
         if complete:
@@ -75,11 +69,7 @@ class NativeAction:
                 if "description" in action and "descriptionStatus" not in action:
                     selected["description"] = action["description"]
                 identity = dict(name=action["name"])
-                if (
-                    operation.intent["kind"] == "action"
-                    and operation.intent["parameters"]["action"] != action["name"]
-                    and "description" in selected
-                ):
+                if match_by == "description" and "description" in selected:
                     identity["description"] = selected["description"]
                 # Ordinary click/named action does not depend on descriptive
                 # text. Bind it only when the request actually uses that text.
@@ -87,9 +77,21 @@ class NativeAction:
                     operation.intent["parameters"].get("button", "left") != "left"
                     or operation.intent["parameters"].get("count", 1) != 1
                 )
-                usable = not pointer_only and len(action_matches(catalogue, identity)) == 1
+                usable = (
+                    not pointer_only
+                    and (match_by != "description" or "description" in identity)
+                    and len(action_matches(catalogue, identity, match_by=match_by)) == 1
+                )
                 identifier = operation.contract(
-                    "native_action", target, within, action=selected, identity=identity, role=role, usable=usable
+                    "native_action",
+                    target,
+                    within,
+                    action=selected,
+                    identity=identity,
+                    role=role,
+                    usable=usable,
+                    matchBy=match_by,
+                    roleRequired=not explicit,
                 )
                 # Preserve ambiguous declarations as unsupported facts. Dropping
                 # them would falsely tell Python that a primary action is absent.
@@ -98,6 +100,7 @@ class NativeAction:
                         id=identifier,
                         unit="native_action",
                         channel="object",
+                        globalInput="no",
                         supported="yes" if usable else "no",
                         readiness="yes" if enabled and usable else "no",
                         pending=[] if enabled else ["enabled"],

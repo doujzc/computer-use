@@ -6,7 +6,7 @@
 
 ## 1. 准备环境
 
-安装 Python 3.12 或 3.13 及 `uv`。构建和电脑操作服务均在被操作桌面的电脑上运行。
+安装 Python 3.11、3.12 或 3.13 及 `uv`。构建和电脑操作服务均在被操作桌面的电脑上运行。
 
 在需要操作桌面的目标电脑上准备原生依赖：
 
@@ -30,7 +30,7 @@ cd computer-use
 uv sync --python 3.12 --no-dev --extra agent
 ```
 
-SDK、MCP 和 Agent 代码以 editable 方式安装到仓库的 `.venv`，同时安装 openJiuwen 等 Agent 依赖。这里显式选择 Python 3.12；已有 Python 3.13 环境也可使用 3.13。以下命令均在仓库根目录执行。
+SDK、MCP 和 Agent 代码以 editable 方式安装到仓库的 `.venv`，同时安装 openJiuwen 等 Agent 依赖。此命令选择 Python 3.12。已有 Python 3.11 或 3.13 环境也可选择对应版本。以下命令均在仓库根目录执行。
 
 构建或准备原生后端，并检查桌面访问条件：
 
@@ -43,7 +43,7 @@ macOS 可运行 `uv run --no-dev --extra agent computer-use-permissions --reques
 
 ## 3. 创建电脑操作 Agent
 
-通过 wheel 安装时选择 `agent` extra。
+通过 wheel 安装时选择 `agent` extra；其中已经包含 MCP。
 
 通过 openJiuwen 的 `ModelClientConfig`、`ModelRequestConfig` 配置支持工具调用和图片输入的模型。以下示例从 `MODEL_PROVIDER`、`API_BASE`、`API_KEY`、`MODEL_NAME` 环境变量读取服务提供方、地址、密钥和模型名称。
 
@@ -85,11 +85,11 @@ uv run --no-dev --extra agent python desktop_agent.py
 
 先核对应用枚举结果，再用流式调用检查实际窗口文字和截图。应用枚举成功仅验证本机后端调用，完整桌面访问还需所需权限和实际观察结果。
 
-Agent 默认以 `exclusive` 模式操作本机桌面。可传入 `config=AgentConfig(desktop="shared")` 选择共享模式，或通过 `AgentConfig.mcp` 配置 `McpConfig` 连接其他 MCP 宿主。异步上下文在对话结束时清理电脑操作会话。
+`AgentConfig.allow_global_input` 默认开启。设为 `False` 可限制本地 MCP 会话的全局输入。通过 `AgentConfig.mcp` 配置 `McpConfig` 可连接其他 MCP 宿主。异步上下文在对话结束时清理电脑操作会话。
 
 ## 4. 接入已有 openJiuwen 项目
 
-宿主项目同样使用 Python 3.12 或 3.13。在宿主项目目录中，将本仓库作为 editable 依赖安装到宿主项目的环境：
+宿主项目同样使用 Python 3.11、3.12 或 3.13。在宿主项目目录中，将本仓库作为 editable 依赖安装到宿主项目的环境：
 
 ```bash
 uv add --editable /absolute/path/to/computer-use --extra agent
@@ -134,4 +134,4 @@ uv run --extra agent computer-use-agent "打开预定会议表单，停在提交
 
 修改 Python 源码后，重启宿主应用或重新创建 Agent／Toolkit 会话；修改依赖或入口后，在源码仓库重新运行 `uv sync --no-dev --extra agent`，并同步宿主项目的依赖。修改原生后端后，先运行 `uv run --no-dev --extra agent computer-use-build`，再重启会话。
 
-引擎调用与观察行为见[MCP 指南中的接口参考](mcp.md#4-接口使用参考)。
+引擎调用与观察行为见[MCP 指南中的接口参考](mcp.md#4-接口使用参考)；开发出包见[打包说明](../PACKAGING.md)。

@@ -6,6 +6,7 @@ import AppKit
 /// AX trees, window capture and foreground selection play no part in identity.
 @MainActor final class ApplicationDiscovery {
     private let instances = ApplicationInstances<NSRunningApplication>()
+    var endedApplicationIDs: [String] { instances.ended }
     private var applicationRoots: [URL] {
         ["/Applications", "/System/Applications", "/System/Library/CoreServices", NSHomeDirectory() + "/Applications"]
             .map { URL(fileURLWithPath: $0) }
@@ -28,18 +29,15 @@ import AppKit
         return instances.id(for: app)
     }
 
-    private func catalogue(continuing: () -> Bool = { true }) -> [ApplicationCatalog.Entry] {
+    func nativeApplications(path: URL? = nil, continuing: () -> Bool) -> [[String: Any]] {
         let active = running.compactMap { app -> ApplicationCatalog.Running? in
             guard let id = selector(for: app) else { return nil }
             return ApplicationCatalog.Running(
                 id: id, url: app.bundleURL, identifier: app.bundleIdentifier, name: app.localizedName,
                 regularUI: app.activationPolicy == .regular)
         }
-        return ApplicationCatalog.list(roots: applicationRoots, running: active, continuing: continuing)
-    }
-
-    func nativeApplications(continuing: () -> Bool) -> [[String: Any]] {
-        catalogue(continuing: continuing).map(\.nativeJSON)
+        return ApplicationCatalog.list(roots: applicationRoots, running: active, path: path, continuing: continuing)
+            .map(\.nativeJSON)
     }
 
     func nativeEntry(for app: NSRunningApplication) -> [String: Any]? {
@@ -112,7 +110,7 @@ import AppKit
                 data: try JSONSerialization.data(withJSONObject: entries, options: [.sortedKeys]), encoding: .utf8)!
             throw DriverError(
                 "multiple running instances match \(selector); candidates: \(json)", code: .ambiguousTarget,
-                next: "use computer.app(candidate.id).read() to inspect the intended instance")
+                next: "use computer.list_windows(app_name=...) with the exact display name, then read the intended app_id and window_ref")
         }
         return candidates.first
     }

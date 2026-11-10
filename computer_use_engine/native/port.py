@@ -11,6 +11,7 @@ from .contracts import (
     Binding,
     Cleanup,
     Facts,
+    GlobalTarget,
     HostPolicy,
     Intent,
     OpenedOperation,
@@ -37,11 +38,13 @@ class NativePort(Protocol):
         policy: Host-owned desktop/foreground policy.
         calls: Sole owner of native call admission, deadlines, and cleanup.
         connection: Driver session and capability metadata used by scope checks.
+        capture_references: Exact native image tokens retained by delivered and pending window maps.
     """
 
     policy: HostPolicy
     calls: "CallLifecycle"
     connection: "Connection"
+    capture_references: frozenset[str]
 
     @property
     def platform(self) -> str:
@@ -95,6 +98,9 @@ class NativePort(Protocol):
         follow_relations: list[str] | None = None,
         focused_fields: list[str] | None = None,
         primary_fields: list[str] | None = None,
+        text_content: bool | None = None,
+        focused_element: bool | None = None,
+        strict_window: bool = False,
     ) -> "DriverObservationReply":
         pass
 
@@ -113,6 +119,13 @@ class NativePort(Protocol):
     async def wait_for_change(
         self, operation: str, target: Binding, after: str, delay_ms: int, timeout_ms: int
     ) -> "Record":
+        pass
+
+    async def app_changes(
+        self, operation: str, target: Binding, application: str, timeout_ms: int,
+        *, after: str | None = None, delay_ms: int | None = None,
+    ) -> "Record":
+        """Read or wait for the observed App generation, independently of old Windows."""
         pass
 
     async def relation(
@@ -135,8 +148,22 @@ class NativePort(Protocol):
     ) -> dict:
         pass
 
+    async def prepare_observation(self, operation: str, target: Binding, timeout_ms: int) -> dict:
+        """Explicit window preparation, never part of an inspect or capture query."""
+        pass
+
     async def execute(self, operation: str, step: int, command: UnitCommand, timeout_ms: int) -> StepResult:
         pass
+
+    async def locate_point(
+        self, target: Binding, point: tuple[float, float] | None, timeout_ms: int
+    ) -> tuple[float, float]:
+        """Resolve original object/image geometry without preparing input."""
+
+    async def execute_global(
+        self, operation: str, target: GlobalTarget, intent: Intent, timeout_ms: int
+    ) -> StepResult:
+        """Dispatch the session's explicit global primitive without object selection."""
 
     async def finish(self, operation: str) -> Cleanup:
         pass

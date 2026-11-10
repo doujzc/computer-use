@@ -2,8 +2,9 @@
 
 import Foundation
 
-/// Evidence that an observed native object still represents the same target.
-/// Mutable input values, selection, enabled state and window titles are not identity.
+/// Native constraints on the retained object in its original working scope.
+/// Display text, values, selection and enabled state may change on that object;
+/// its reference does not promise an immutable, unobservable business meaning.
 struct ElementIdentity: Equatable {
     struct Facts {
         var values: [String: String] = [:]
@@ -17,43 +18,26 @@ struct ElementIdentity: Equatable {
     // These are native, advertised positions, not labels or a parsed A1 name.
     static let positionKeys: Set<String> = ["AXRowIndexRange", "AXColumnIndexRange"]
     static let keys =
-        ["AXRole", "AXSubrole", "AXIdentifier", "AXURL", "AXTitle", "AXDescription", "AXDocument"]
+        ["AXRole", "AXSubrole", "AXIdentifier", "AXURL", "AXDocument"]
         + positionKeys.sorted()
-    private static let labelledRoles: Set<String> = [
-        "AXButton", "AXMenuItem", "AXMenuBarItem", "AXCheckBox", "AXRadioButton", "AXLink", "AXRow"
-    ]
 
-    init(
-        role: String, subrole: String?, identifier: String?, url: String?, title: String?, description: String?,
-        document: String? = nil
-    ) {
-        var attributes = role.isEmpty ? [:] : ["AXRole": role]
-        for (key, value) in [
-            ("AXSubrole", subrole), ("AXIdentifier", identifier), ("AXURL", url), ("AXDocument", document)
-        ] { if let value, !value.isEmpty { attributes[key] = value } }
-        // A reused command/record with a different label is a different action.
-        // Editor text can legitimately change during this observation's lifetime.
-        if Self.labelledRoles.contains(role) {
-            for (key, value) in [("AXTitle", title), ("AXDescription", description)] {
-                if let value, !value.isEmpty { attributes[key] = value }
-            }
-        }
-        self.attributes = attributes
-        self.absent = []  // Optional arguments do not establish native absence.
-    }
-
-    init(facts: Facts, roleHint: String? = nil) {
-        var keys = Set(Self.keys)
-        if !Self.labelledRoles.contains(facts.values["AXRole"] ?? roleHint ?? "") {
-            keys.subtract(["AXTitle", "AXDescription"])
-        }
-        attributes = facts.values.filter { keys.contains($0.key) && !$0.value.isEmpty }
-        absent = facts.absent.union(facts.values.filter { $0.value.isEmpty }.map(\.key)).intersection(keys)
+    init(facts: Facts) {
+        let keys = Set(Self.keys)
+        self.init(
+            attributes: facts.values.filter { keys.contains($0.key) && !$0.value.isEmpty },
+            absent: facts.absent.union(facts.values.filter { $0.value.isEmpty }.map(\.key)).intersection(keys))
     }
 
     private init(attributes: [String: String], absent: Set<String>) {
-        self.attributes = attributes
-        self.absent = absent
+        var keys = Set(Self.keys)
+        // An identified native row may move when neighbours are inserted or
+        // sorted. Its advertised ordinal is not another identity requirement.
+        // Unidentified virtual rows and positional cells retain position checks.
+        if attributes["AXRole"] == "AXRow", let identifier = attributes["AXIdentifier"], !identifier.isEmpty {
+            keys.subtract(Self.positionKeys)
+        }
+        self.attributes = attributes.filter { keys.contains($0.key) }
+        self.absent = absent.intersection(keys)
     }
 
     /// Missing evidence does not contradict the old identity. Preserve known
@@ -86,4 +70,61 @@ struct ElementIdentity: Equatable {
     }
 
     func matches(_ current: [String: String]) -> Bool { check(Facts(values: current)) == .matched }
+
+    /// An optional native document witness may resolve exactly one reported
+    /// location change. Other attributes, unknown fields and absent URLs keep
+    /// their ordinary identity semantics.
+    func locationChange(_ current: Facts) -> Bool {
+        guard attributes["AXRole"] == "AXWebArea", let url = attributes["AXURL"], let latest = current.values["AXURL"],
+            !latest.isEmpty, latest != url
+        else { return false }
+        var fixed = current
+        fixed.values["AXURL"] = url
+        return check(fixed) == .matched
+    }
+
+    func preservingLocation(from previous: Self) -> Self? {
+        guard previous.locationChange(.init(values: attributes, absent: absent)), let url = previous.attributes["AXURL"]
+        else { return nil }
+        var fixed = attributes
+        fixed["AXURL"] = url
+        return Self(attributes: fixed, absent: absent)
+    }
+
+    /// Ancestor metadata is not automatically a descendant's identity. A
+    /// layout group's identifier/URL, or a window's subrole/identifier, can
+    /// change while the exact child remains alive. Keep only actual ownership
+    /// boundaries here; NativeScopeResolver independently checks the fixed
+    /// window lifecycle and current input membership before dispatch.
+    func inheritedBoundary(inMenu: Bool) -> Self? {
+        let role = attributes["AXRole"] ?? ""
+        let keys: Set<String>
+        if ["AXWindow", "AXSheet", "AXPopover"].contains(role) {
+            keys = ["AXRole", "AXDocument"]
+        } else if role == "AXRow" || !Set(attributes.keys).isDisjoint(with: Self.positionKeys) {
+            // A reused row/cell can keep its AX address while acquiring a
+            // different identifier or advertised position.
+            keys = Set(Self.keys)
+        } else if role == "AXMenuBar" || inMenu && ["AXMenu", "AXMenuItem", "AXMenuBarItem"].contains(role) {
+            keys = ["AXRole", "AXIdentifier"]
+        } else if attributes["AXDocument"] != nil || role == "AXWebArea" && attributes["AXURL"] != nil {
+            keys = Set(["AXRole", "AXDocument"])
+                .union(role == "AXWebArea" ? ["AXURL"] : [])
+        } else {
+            return nil
+        }
+        return Self(attributes: attributes.filter { keys.contains($0.key) }, absent: absent.intersection(keys))
+    }
+
+    /// Field names suffice to explain a rejection without logging document
+    /// URLs, identifiers or other application content.
+    func changedFields(in current: Facts) -> [String] {
+        attributes.keys.filter { key in
+            current.absent.contains(key) || current.values[key].map { $0 != attributes[key] } == true
+        }.sorted()
+    }
+
+    func unavailableFields(in current: Facts) -> [String] {
+        attributes.keys.filter { current.values[$0] == nil && !current.absent.contains($0) }.sorted()
+    }
 }

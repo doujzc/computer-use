@@ -18,6 +18,8 @@ from time import monotonic
 from typing import Literal
 
 from computer_use.errors import ComputerUseError
+from computer_use.session.events import observation_delivered
+from computer_use.session.observation import observation_document, peek_observation_text
 from computer_use_mcp.diagnostics import Journal
 
 
@@ -74,20 +76,44 @@ class Episode:
         self.record("action_receipt", receipt=receipt)
 
     def observation(self, event):
-        # Session events contain live owners/IR. As in MCP Runtime, project
-        # captured evidence rather than serializing (or persisting) bindings.
-        if event["kind"] in ("invalidate", "discard-pending"):
-            self.record("observation_lifecycle", change=event["kind"])
+        kind = event["kind"]
+        if kind == "action-observation":
+            result = event["result"]
+            self.record(
+                "related_observation",
+                status=result.observation_status,
+                error=result.observation_error,
+                window_lifecycle=result.window_lifecycle,
+            )
             return
+        if kind != "observed":
+            self.record("observation_lifecycle", change=kind)
+            if kind == "before-write":
+                self.require_log()
+            return
+
+        # Preserve prepared evidence without rendering the tree or logging live
+        # owners and element bindings.
         captured = event["observation"]
-        self.record(
-            "observation",
-            scope=captured["scope"],
-            view=captured["view"],
-            text=captured["state"]["text"],
-            element_refs=list(captured["refs"]),
-            observed=captured.get("observed"),
-        )
+        state = captured["state"]
+        row = {
+            "scope": captured["scope"],
+            "view": captured["view"],
+            "element_refs": list(captured["refs"]),
+            "observed": captured.get("observed"),
+        }
+        materialized = peek_observation_text(state)
+        if materialized is not None:
+            row["text"] = materialized
+        else:
+            row["text_materialized"] = False
+            document = captured.get("document") or observation_document(state)
+            summary = getattr(document, "summary_data", None)
+            if summary is not None:
+                row["presentation"] = summary()
+        self.record("observation", **row)
+        if "logError" not in self.journal.metadata():
+            observation_delivered(state)
 
     @contextmanager
     def step(self, name):

@@ -33,9 +33,7 @@ def create(*, services: NativeAppReader) -> Callable[[WindowChoiceDraft, Control
 
         request, overview, current = value.request, value.overview, value.current
         if request.selection is not None:
-            # The pipeline shares retained bindings with their owning service.
-            # pylint: disable-next=protected-access
-            services._selection(
+            services.select_working_window(
                 request.application,
                 request.name,
                 current,
@@ -50,17 +48,13 @@ def create(*, services: NativeAppReader) -> Callable[[WindowChoiceDraft, Control
                     document=DisplayDocument.join(
                         (
                             overview.document,
-                            (
-                                "Window catalogue changed after these thumbnails; some pictured windows may "
-                                "have closed and new windows may not be pictured. Use the current Windows "
-                                "list."
-                            ),
+                            ("Window catalogue changed after the thumbnail captures."),
                         )
                     ),
                 )
             error = failure(
                 error.code,
-                ("The window catalogue changed during observation; select an entry from the current Windows list."),
+                ("The window catalogue changed during observation."),
             )
         return WindowSelectionRequired(
             error, request.application, request.name, current, overview=overview, selection=request.selection

@@ -12,6 +12,7 @@ No clipboard substitution, value setter or editor search belongs here.
 
 import time
 
+from computer_use_linux.contracts.input_authority import require_global_input
 from computer_use_linux.contracts.protocol import Failure, integer, require
 from computer_use_linux.control.native_keyboard import NativeKeyboard
 from computer_use_linux.control.native_selection import Changed
@@ -70,7 +71,7 @@ class NativeTypedText(NativeKeyboard):
         try:
             self.preflight(operation, shortcut_selection=shortcut_selection)
         except Failure as error:
-            if error.code not in ("input_unavailable", "mode_unsupported"):
+            if error.code not in ("input_unavailable", "unsupported_operation"):
                 raise
             mapped = False
         supported = mapped and r["editable"] and self.supported(r, target)
@@ -78,8 +79,6 @@ class NativeTypedText(NativeKeyboard):
             # FOCUSED may name a scope rather than its internal editor. An
             # insertion cannot silently click and relocate its unknown caret.
             supported = supported and operation.intent["kind"] == "replace"
-        if shortcut_selection:
-            supported = supported and (self.b.mode == "exclusive" or self.desktop.assist)
         selection_known = "unknown"
         pending = [] if r["enabled"] else ["enabled"]
         if operation.intent["kind"] == "replace":
@@ -114,6 +113,9 @@ class NativeTypedText(NativeKeyboard):
             id=identifier,
             unit="key_sequence",
             channel="keyboard",
+            globalInput=(
+                "no" if operation.intent["kind"] == "insert" and not operation.intent["parameters"]["text"] else "yes"
+            ),
             supported="yes" if supported else "no",
             readiness="yes" if supported and not pending else "no",
             pending=pending,
@@ -140,11 +142,6 @@ class NativeTypedText(NativeKeyboard):
         if not foreground:
             operation.background_unavailable.add(key)
             return False
-        require(
-            self.b.mode == "exclusive" or self.desktop.assist,
-            "Host policy does not permit foreground assistance.",
-            "mode_unsupported",
-        )
         self.desktop.require_idle_input()
         preparation.append("foreground")
         self.desktop.activate(r["window"], ctx)
@@ -157,11 +154,6 @@ class NativeTypedText(NativeKeyboard):
 
         def guard():
             nonlocal gesture
-            require(
-                self.b.mode == "exclusive" or self.desktop.assist,
-                "Addressed pointer focus requires exclusive mode or host foreground-assist authorization.",
-                "mode_unsupported",
-            )
             r = self.guard(contract, ctx)
             require(r["route"], "The original working window is not the keyboard window.", "input_unavailable")
             target, within = self.target.selected(
@@ -293,6 +285,8 @@ class NativeTypedText(NativeKeyboard):
             content_started = True
 
         try:
+            if operation.intent["kind"] != "insert" or operation.intent["parameters"]["text"]:
+                require_global_input(self.desktop)
             self.ax.begin(ctx)
             self.preflight(operation, shortcut_selection=contract["shortcutSelection"])
             if preparing:

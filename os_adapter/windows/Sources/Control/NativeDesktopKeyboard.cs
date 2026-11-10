@@ -7,12 +7,13 @@ using System.Runtime.InteropServices;
 
 namespace ComputerUse.Windows
 {
-    // Explicit exclusive-desktop input follows the real foreground queue. It
+    // Explicit authorized desktop input follows the real foreground queue. It
     // does not infer an Element, activate a window, or query an application's
     // UIA provider. Addressed App/Element operations retain their own contracts.
-    internal sealed class NativeDesktopKeyboard : INativeKeyboardProvider, INativeKeyboardTextProvider
+    internal sealed class NativeDesktopKeyboard : INativeKeyboardProvider, INativeGlobalKeyboardAuthority,
+                                                  INativeKeyboardTextProvider
     {
-        readonly NativePointerCaptures captures;
+        readonly bool globalInputAllowed;
         sealed class Receiver
         {
             internal IntPtr Window, Focus;
@@ -20,9 +21,9 @@ namespace ComputerUse.Windows
             internal long Generation;
         }
 
-        internal NativeDesktopKeyboard(NativePointerCaptures captures)
+        internal NativeDesktopKeyboard(bool allowGlobalInput = false)
         {
-            this.captures = captures;
+            globalInputAllowed = allowGlobalInput;
         }
 
         static void Check(Request r)
@@ -33,42 +34,31 @@ namespace ComputerUse.Windows
             NativeDesktopState.RequireInput();
         }
 
-        public NativeKeyboardState Read(Dictionary<string, object> target, string[] within, Request r, bool text = false)
+        public NativeKeyboardState Read(Dictionary<string, object> target, string[] within, Request r,
+                                        bool text = false)
         {
+            NativeGlobalInput.Require(globalInputAllowed);
             Check(r);
-            if (target["surface"] != null || target["node"] != null || within.Length != 0)
+            if (!NativeBinding.IsGlobal(target) || within.Length != 0)
                 throw new Failure("invalid_request", "desktop keyboard cannot address a window or element");
-            var image = captures.Get(target);
-            if (new NativePointerLayout().Signature != image.Layout)
-                throw new Failure("snapshot_expired", "display layout changed; read the desktop again");
             var window = Native.GetForegroundWindow();
             NativeInputAccess.RequireWindow(window, "foreground window");
-            var focus = window == IntPtr.Zero ? IntPtr.Zero : Native.Focus(window);
-            var receiver = new Receiver
-            {
-                Window = window,
-                Focus = focus,
-                Pid = focus == IntPtr.Zero ? 0 : Native.PID(focus),
-                Generation = focus == IntPtr.Zero ? 0 : Native.Generation(focus)
-            };
+            var focus = text && window != IntPtr.Zero ? Native.Focus(window) : IntPtr.Zero;
+            var receiver =
+                new Receiver { Window = window, Focus = focus, Pid = focus == IntPtr.Zero ? 0 : Native.PID(focus),
+                               Generation = focus == IntPtr.Zero ? 0 : Native.Generation(focus) };
             // A global shortcut can operate the shell even with no focused edit.
             // Text needs an actual native recipient, which the sequence pins.
             bool ready = !text || window != IntPtr.Zero && focus != IntPtr.Zero && Native.Inside(window, focus);
             Check(r);
-            return new NativeKeyboardState
-            {
-                Native = receiver,
-                Label = "Foreground desktop",
-                Enabled = true,
-                Foreground = true,
-                WindowRoute = ready,
-                Focused = ready,
-                TextWritable = true
-            };
+            return new NativeKeyboardState { Native = receiver,  Label = "Foreground desktop", Enabled = true,
+                                             Foreground = true,  WindowRoute = ready,          Focused = ready,
+                                             TextWritable = true };
         }
 
         public void RequireIdle(NativeKeyEvent[] events, Request r)
         {
+            NativeGlobalInput.Require(globalInputAllowed);
             Check(r);
             Native.Released();
             foreach (ushort key in events.Where(e => !e.Up && !e.Unicode).Select(e => e.Code).Distinct())
@@ -79,7 +69,9 @@ namespace ComputerUse.Windows
 
         public void Activate(NativeKeyboardState state, Request r)
         {
-            throw new Failure("input_unavailable", "desktop input follows the current foreground; choose its recipient with a desktop click or shortcut");
+            throw new Failure(
+                "input_unavailable",
+                "desktop input follows the current foreground; choose its recipient with a desktop click or shortcut");
         }
 
         public void Focus(NativeKeyboardState state, Request r)
@@ -87,10 +79,15 @@ namespace ComputerUse.Windows
             throw new Failure("invalid_request", "desktop input has no addressed element to focus");
         }
 
+        public void RequireGlobalInput()
+        {
+            NativeGlobalInput.Require(globalInputAllowed);
+        }
+
         public int Send(NativeKeyEvent[] events)
         {
             var inputs = events.Select(e => Native.Key(e.Code, e.Up, e.Unicode, e.Extended)).ToArray();
-            return (int)Native.SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(Native.INPUT)));
+            return (int)Native.SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(Native.INPUT)), globalInputAllowed);
         }
 
         sealed class Sequence : INativeKeyboardSequence
@@ -106,8 +103,12 @@ namespace ComputerUse.Windows
             {
                 Check(r);
                 NativeInputAccess.RequireWindow(original.Window, "foreground window");
-                if (original.Window == IntPtr.Zero || original.Focus == IntPtr.Zero || !Native.IsWindow(original.Focus) || Native.GetForegroundWindow() != original.Window || Native.Focus(original.Window) != original.Focus || Native.PID(original.Focus) != original.Pid || Native.Generation(original.Focus) != original.Generation)
-                    throw new Failure("input_unavailable", "the native desktop text recipient changed; remaining text was not sent");
+                if (original.Window == IntPtr.Zero || original.Focus == IntPtr.Zero ||
+                    !Native.IsWindow(original.Focus) || Native.GetForegroundWindow() != original.Window ||
+                    Native.Focus(original.Window) != original.Focus || Native.PID(original.Focus) != original.Pid ||
+                    Native.Generation(original.Focus) != original.Generation)
+                    throw new Failure("input_unavailable",
+                                      "the native desktop text recipient changed; remaining text was not sent");
             }
         }
 
@@ -115,7 +116,6 @@ namespace ComputerUse.Windows
         {
             return new Sequence((Receiver)state.Native, r);
         }
-
         public NativeTextSelection Selection(NativeKeyboardState state, Request r)
         {
             throw new Failure("invalid_request", "desktop typing inserts text; replacement requires an Element");

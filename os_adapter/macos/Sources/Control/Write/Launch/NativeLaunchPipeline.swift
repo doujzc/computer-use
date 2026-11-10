@@ -9,8 +9,15 @@ import ApplicationServices
     {
         let payload = try JSONSerialization.data(
             withJSONObject: command.value, options: [.sortedKeys, .withoutEscapingSlashes])
-        return try await op.execute(step: step, payload: payload) {
-            await DispatchNativeLaunchPass.run(op, command: command, access: access)
+        return try await op.execute(step: step, payload: payload, candidateID: command.primitiveID) {
+            let activity = NativeInputActivity(
+                operation: op.token, step: step, command: command.kind, intent: op.request.kind, target: command.target,
+                globalInputAllowed: NativeInputAuthorization.globalInputAllowed)
+            return await NativeInputActivity.$current.withValue(activity) {
+                let receipt = await DispatchNativeLaunchPass.run(op, command: command, access: access)
+                receipt.impact = activity.finish(dispatch: receipt.dispatch, cleanup: receipt.cleanup)
+                return receipt.wire
+            }
         }
     }
 }

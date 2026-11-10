@@ -9,6 +9,7 @@ from enum import Enum
 from typing import TYPE_CHECKING
 
 from computer_use.interaction.read.acquisition.components.support import ObservationGap
+from computer_use.native.query.directory import SurfaceReadProfile
 from computer_use.pipeline import Effect
 
 if TYPE_CHECKING:
@@ -45,6 +46,9 @@ class ReadPlan:
         applications: Application catalogue captured while resolving the requested scope.
         launch: Original startup receipt; retained even when later observation fails.
         limits: Requested native collection, image, and view limits.
+        profile: Original immutable directory intent used by scope refreshes.
+        scope_managed: Defer changed-scope work and final projection to the interface collector.
+        include_menus: Whether to collect the optional app-wide menu summary in this attempt.
     """
 
     selection: WorkingWindow
@@ -52,6 +56,9 @@ class ReadPlan:
     applications: DirectoryFacts | None
     launch: Mapping[str, Any] | None
     limits: Mapping[str, Any]
+    profile: SurfaceReadProfile
+    scope_managed: bool = False
+    include_menus: bool = True
 
 
 @dataclass(frozen=True)
@@ -85,7 +92,6 @@ class ReadRunState:
         plan: Fixed working scope and limits used by bounded component acquisition.
         target: Native identity of the element, window, or application being observed.
         directory: Observed application/window catalogue, including incomplete relationships.
-        initializing: Whether startup evidence permits the existing bounded refresh allowance.
         attempt: Zero-based attempt count consumed by the acquisition refresh gate.
         refresh_tree: Whether to refresh only the tree while retaining already captured pixels.
         components: Tree, image, menu, and overview results collected for this attempt.
@@ -95,7 +101,6 @@ class ReadRunState:
     plan: ReadPlan
     target: Binding
     directory: DirectoryFacts
-    initializing: bool
     attempt: int = 0
     refresh_tree: bool = False
     components: Components | None = None

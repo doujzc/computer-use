@@ -29,6 +29,79 @@ import ApplicationServices
         self.pointer = pointer
     }
 
+    func requireSession(_ value: String) throws {
+        guard value == session else { throw DriverError("request belongs to another session", code: .staleTarget) }
+    }
+
+    /// Resolve once, independently of input admission. The subsequent global
+    /// event uses this screen point without following or checking the object.
+    func locatePoint(_ raw: Any?) throws -> [String: Any] {
+        let request = try object(raw, keys: ["target", "point"])
+        let target = try NativeTarget(request["target"])
+        try target.requireSession(session)
+        try RequestDiagnostics.checkCancellation()
+        let result: CGPoint
+        if let capture = target.capture {
+            guard target.node == nil else {
+                throw DriverError("a point locator cannot mix image and element references", code: .invalidRequest)
+            }
+            let pixel = try object(request["point"], keys: ["x", "y"])
+            let point = CGPoint(x: try number(pixel["x"], label: "point.x"), y: try number(pixel["y"], label: "point.y"))
+            if target.isDesktopImage {
+                guard target.instance == nil, target.rootWindow == nil else {
+                    throw DriverError("desktop point locator has an application identity", code: .invalidRequest)
+                }
+                let mapping = try desktop().observed(capture)
+                result = try mapping.geometry.point(x: point.x, y: point.y, captured: mapping.captured)
+            } else {
+                let entry = try captures.retained(capture)
+                guard NSDictionary(dictionary: entry.binding).isEqual(to: target.wire),
+                    !entry.surface.owner.isTerminated
+                else {
+                    throw DriverError("image point belongs to another binding", code: .staleTarget)
+                }
+                let original = entry.mapping
+                guard let row = WindowServerInfo.window(original.id),
+                    let pid = (row[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
+                    let bounds = row[kCGWindowBounds as String] as? [String: Any],
+                    let frame = CGRect(dictionaryRepresentation: bounds as CFDictionary)
+                else { throw ObservationChanged("point target window is unavailable") }
+                let current = WindowGeometry.WindowMapping(
+                    id: original.id, pid: pid, frame: frame, title: original.title,
+                    width: original.width, height: original.height)
+                result = try NativeCapturedPointerPlan.resolve(original: original, current: current).point(point)
+            }
+        } else {
+            guard request["point"] is NSNull, let node = target.node else {
+                throw DriverError("element point locator requires an element and no image point", code: .invalidRequest)
+            }
+            let element = try applications.pointElement(node, scope: target.surface)
+            var position = CGPoint.zero, size = CGSize.zero
+            guard let origin = AXAccess.read(element, kAXPositionAttribute).value,
+                let dimensions = AXAccess.read(element, kAXSizeAttribute).value,
+                CFGetTypeID(origin) == AXValueGetTypeID(), CFGetTypeID(dimensions) == AXValueGetTypeID(),
+                AXValueGetValue(unsafeDowncast(origin, to: AXValue.self), .cgPoint, &position),
+                AXValueGetValue(unsafeDowncast(dimensions, to: AXValue.self), .cgSize, &size),
+                [position.x, position.y, size.width, size.height].allSatisfy(\.isFinite), size.width > 0, size.height > 0
+            else { throw DriverError("original element has no usable frame", code: .observationIncomplete) }
+            result = CGPoint(x: position.x + size.width / 2, y: position.y + size.height / 2)
+        }
+        try RequestDiagnostics.checkCancellation()
+        return ["point": ["x": result.x, "y": result.y]]
+    }
+
+    func observationSurface(_ binding: [String: Any]) throws -> NativeDirectory.Surface {
+        try sharing.checkAvailable()
+        return try directory.windowScope(
+            instance: string(binding["instance"], label: "instance"),
+            root: string(binding["rootWindow"], label: "rootWindow"),
+            surface: string(binding["surface"], label: "surface")).surface
+    }
+
+    func retainDesktopWindow(_ native: NativeWindows.Window, owner: NSRunningApplication) -> [String: Any] {
+        directory.retainDesktopWindow(native, owner: owner)
+    }
+
     func observePointer(_ binding: [String: Any]) {
         guard let scope = binding["surface"] as? String, let mapping = directory.surface(scope)?.native?.mapping else {
             return
@@ -51,7 +124,62 @@ import ApplicationServices
         return try inputScope(value, canonicalize: canonicalize, observed: observed)
     }
 
-    private func inputScope(_ target: NativeTarget, canonicalize: Bool, observed: NativeApplicationReader.ReadRoot?)
+    /// Optional restitution borrows retained ownership, never a fresh input
+    /// boundary query on a target that the action may just have closed.
+    func retainedForegroundSource(_ binding: [String: Any]) -> (application: NSRunningApplication, element: AXUIElement?)? {
+        guard let scope = binding["surface"] as? String else { return nil }
+        guard let application = directory.surface(scope)?.owner ?? directory.applicationRoot(scope)?.owner else { return nil }
+        return (application, (binding["node"] as? String).flatMap { applications.visualElement($0) }
+                ?? directory.surface(scope)?.element)
+    }
+
+    func fixedInputWindow(_ binding: [String: Any]) throws -> NativeFixedInputWindow? {
+        let requested = try NativeTarget(binding)
+        try requested.requireSession(session)
+        let entry = try appSelections.entry(try string(requested.instance, label: "instance"))
+        let id = try string(requested.surface, label: "surface")
+        guard requested.rootWindow == entry.root else {
+            throw DriverError("working root changed", code: .staleTarget)
+        }
+        guard directory.applicationRoot(id) == nil else { return nil }
+        guard let selected = directory.surface(id), selected.owner.isEqual(entry.owner) else {
+            throw DriverError("original mechanism window binding changed", code: .staleTarget)
+        }
+        if let node = requested.node {
+            let read = try applications.readRoot(node)
+            guard read.scope == id, read.application.isEqual(entry.owner) else {
+                throw DriverError("node belongs to a different mechanism window", code: .staleTarget)
+            }
+        }
+        // This is optional mechanism evidence, not another admission boundary.
+        // The original physical identity must survive, but an incomplete AX
+        // catalogue must not turn a missing proxy into a public "closed" error.
+        if selected.native != nil {
+            switch directory.nativeWindowPresence(selected) {
+            case .ended: throw DriverError("original mechanism window lifetime ended", code: .staleTarget)
+            case .live: break
+            case .unknown, nil: return nil
+            }
+        }
+        let windows = try applications.windows(
+            entry.owner, nativeWindows: selected.native.map { [$0] } ?? [],
+            contentRoot: selected.element, purpose: .inputValidation)
+        let matches = windows.filter { $0.ref == selected.window }
+        guard matches.count == 1, let window = matches.first else { return nil }
+        if let native = selected.native {
+            guard window.nativeID == native.mapping.id else { return nil }
+        } else {
+            // AX-only scopes retain their original exact object. Without a
+            // physical ID there is no proof authorizing a replacement proxy.
+            guard let original = selected.element, CFEqual(window.element, original) else { return nil }
+        }
+        return NativeFixedInputWindow(application: entry.owner, window: window.element)
+    }
+
+    private func inputScope(
+        _ target: NativeTarget, canonicalize: Bool, observed: NativeApplicationReader.ReadRoot?,
+        popupOwner: AXUIElement? = nil
+    )
         throws -> NativeInputScope
     {
         var value = target
@@ -68,9 +196,14 @@ import ApplicationServices
             }
         }
         if let menu = try directory.applicationRootScope(instance: instance, root: value.rootWindow, surface: surface) {
+            guard menu.kind == .menuBar else {
+                throw DriverError(
+                    "the application content scope does not have an addressed input receiver", code: .inputUnavailable)
+            }
             if let root = entry.root {
+                let native = NativeWindows.listIfAvailable(entry.owner)
                 let windows = try applications.windows(
-                    entry.owner, nativeWindows: NativeWindows.list(entry.owner),
+                    entry.owner, nativeWindows: native ?? [],
                     contentRoot: directory.windowElement(root, owner: entry.owner), purpose: .inputValidation)
                 guard let window = windows.first(where: { $0.ref == root })?.element else {
                     throw DriverError("the menu's original working window closed", code: .staleTarget)
@@ -80,7 +213,8 @@ import ApplicationServices
                     windows: windows.map { .init(ref: $0.ref, parent: $0.parent, modal: $0.modal == true) },
                     focused: applications.focusedWindow(entry.owner, windows: windows))
                 return NativeInputScope(
-                    wire: value.wire, application: entry.owner, window: window, menuRoot: menu.element, blocked: blocked
+                    wire: value.wire, application: entry.owner, window: window, menuRoot: menu.element, blocked: blocked,
+                    windowEvidence: .init(windows: windows, nativeWindows: native)
                 )
             }
             try BackgroundTarget(entry.owner).validateWindowlessMenu()
@@ -103,7 +237,7 @@ import ApplicationServices
         let interactionSurface = observed?.observedInteractionSurface.map {
             WindowGeometry.presentedWindow($0, pid: entry.owner.processIdentifier)
         }
-        let contentRoot = try workingRoot.map { original in
+        let contentRoot = try popupOwner ?? workingRoot.map { original in
             guard let selected = interactionSurface ?? discovered.element else { return original }
             return try NativeWindowBoundary.contentRoot(
                 workingRoot: original, target: selected, same: { CFEqual($0, $1) },
@@ -120,14 +254,19 @@ import ApplicationServices
                         ? parent : nil
                 })
         }
+        var coverageComplete = true
+        let noteIssue: (NativeApplicationReader.WindowIssue) -> Void = { _ in coverageComplete = false }
         var windows = try applications.windows(
-            entry.owner, nativeWindows: native, contentRoot: contentRoot, purpose: .inputValidation)
+            entry.owner, nativeWindows: native, contentRoot: contentRoot, purpose: .inputValidation,
+            reportIssue: noteIssue)
         // The hint cannot replace proof that the original App root is live.
         // It may itself be a deep popover omitted by the narrower scan.
-        if let original = workingRoot, let contentRoot, !CFEqual(original, contentRoot),
+        if popupOwner == nil, let original = workingRoot, let contentRoot, !CFEqual(original, contentRoot),
             !windows.contains(where: { $0.ref == root })
         {
-            windows = try applications.windows(entry.owner, nativeWindows: native, purpose: .inputValidation)
+            coverageComplete = true
+            windows = try applications.windows(
+                entry.owner, nativeWindows: native, purpose: .inputValidation, reportIssue: noteIssue)
         }
         guard windows.contains(where: { $0.ref == root }), windows.contains(where: { $0.ref == discovered.window })
         else { throw DriverError("the original working window or surface closed", code: .staleTarget) }
@@ -179,10 +318,12 @@ import ApplicationServices
                 })
         {
             return NativeInputScope(
-                wire: value.wire, application: entry.owner, window: popup, menuRoot: nil, blocked: blocked)
+                wire: value.wire, application: entry.owner, window: popup, menuRoot: nil, blocked: blocked,
+                windowEvidence: .init(windows: windows))
         }
         return NativeInputScope(
-            wire: value.wire, application: entry.owner, window: nativeWindow, menuRoot: nil, blocked: blocked)
+            wire: value.wire, application: entry.owner, window: nativeWindow, menuRoot: nil, blocked: blocked,
+            windowEvidence: .init(windows: windows, coverageComplete: coverageComplete))
     }
 
     /// QUERY admission for an already selected, unconstrained local dispatch.
@@ -224,18 +365,25 @@ import ApplicationServices
             applications.knownWindowReference(anchor.window, app: anchor.application, process: anchor.process)
                 == anchor.rootReference
         else { return .needsLegacy("original AX alias is no longer known") }
-        let projection = try applications.keyboardBoundary(anchor.application, contentRoot: anchor.window)
-        let decision = NativeKeyboardBoundaryPolicy.decide(
+        guard let native = NativeWindows.listIfAvailable(anchor.application),
+            native.contains(where: { $0.mapping.id == anchor.nativeID && $0.process == anchor.process })
+        else { return .needsLegacy("original keyboard WindowServer identity needs full scope") }
+        let hints = try directory.retainedModalHints(owner: anchor.application, native: native)
+        let boundary = try applications.inputBoundary(
+            anchor.application, nativeWindows: native, contentRoot: anchor.window, required: [anchor.window],
+            modalHints: hints, expandMissingRequired: false)
+        let nativeIDs = Set(boundary.windows.compactMap(\.nativeID))
+        guard boundary.windows.contains(where: { CFEqual($0.element, anchor.window) && $0.nativeID == anchor.nativeID }),
+            native.allSatisfy({ nativeIDs.contains($0.mapping.id) }), boundary.unresolvedModalHints.isEmpty
+        else { return .needsLegacy("native window or retained modal needs full scope") }
+        let projection = NativeKeyboardBoundaryProjection(
+            windows: boundary.windows.map {
+                .init(key: $0.ref, element: $0.element, role: $0.kind == "sheet" ? kAXSheetRole : $0.kind,
+                      modal: $0.modal, parent: $0.parent, parentKnown: !$0.parentUnknown)
+            },
+            issue: boundary.issue)
+        return NativeKeyboardBoundaryPolicy.decide(
             original: anchor.window, projection: projection, same: { CFEqual($0, $1) })
-        if decision == .confirmed, let root = projection.windows.first(where: { CFEqual($0.element, anchor.window) }) {
-            // Same boundary algorithm, with sample-private keys. No modal can
-            // enter this branch: all known modal results require the original Gate.
-            let blocked = try NativeWindowBoundary.blocked(
-                root: root.key, target: root.key,
-                windows: projection.windows.map { .init(ref: $0.key, parent: $0.parent, modal: $0.modal == true) })
-            if !blocked.isEmpty { return .needsLegacy("live modal requires full scope") }
-        }
-        return decision
     }
 
     /// Explicit full-query port, selected only by the parent keyboard Gate.
@@ -253,14 +401,24 @@ import ApplicationServices
     func checkContainment(_ binding: [String: Any], within: [String], op: NativeOperation) throws {
         guard !within.isEmpty else { return }
         let node = try string(binding["node"], label: "node")
-        let leaf = try applications.readRoot(node).element
+        let read = try applications.readRoot(node)
+        if let menu = directory.applicationRoot(read.scope), menu.kind == .menuBar {
+            let anchors = try within.map { try applications.readRoot($0) }
+            guard anchors.allSatisfy({ $0.scope == read.scope && $0.application.isEqual(menu.owner) }) else {
+                throw DriverError("selected menu ancestry belongs to a different scope", code: .staleTarget)
+            }
+            try op.check()
+            if try NativeMenuUnit.membership(anchors.map(\.element) + [read.element], root: menu.element) == .confirmed {
+                return
+            }
+        }
         let anchors = try within.map { ref in
             var anchored = binding
             anchored["node"] = ref
             _ = try target(anchored, input: true)
             return try applications.readRoot(ref).element
         }
-        try checkNativeContainment(leaf, anchors: anchors, op: op)
+        try checkNativeContainment(read.element, anchors: anchors, op: op)
     }
 
     func checkNativeContainment(_ leaf: AXUIElement, anchors: [AXUIElement], op: NativeOperation) throws {
@@ -320,7 +478,12 @@ import ApplicationServices
                     throw DriverError("selected scrolling object is blocked by a modal", code: .blockedByModal)
                 }
                 let element = try applications.readRoot(ref).element
-                if AXAccess.read(element, kAXEnabledAttribute).value as? Bool == false {
+                // The content owner only locates this viewport. Permission
+                // belongs to the selected wheel region and hit; owner aliases
+                // of either receiver are therefore still checked here.
+                if (ref == region || ref == actuator.node),
+                    AXAccess.read(element, kAXEnabledAttribute).value as? Bool == false
+                {
                     throw DriverError("selected scrolling object is disabled", code: .inputUnavailable)
                 }
                 objects[ref] = element
@@ -373,13 +536,19 @@ import ApplicationServices
         if let menu = scope.menuRoot {
             // An application menu has no AXWindow. Its membership is proved
             // against the retained, freshly re-read AXMenuBar instead.
-            if !CFEqual(read.element, menu) {
+            if !CFEqual(read.element, menu),
+                try NativeMenuUnit.membership(read.ancestors + [read.element], root: menu) != .confirmed
+            {
+                let reader = AXRelationReader()
                 let evidence = try NativeContainment.check(
                     leaf: read.element, within: [menu], same: { CFEqual($0, $1) },
                     parent: { AXAccess.element($0, kAXParentAttribute) },
-                    children: { AXAccess.elements($0, kAXChildrenAttribute, limit: 2048) },
+                    children: { try NativeMenuUnit.menuChildren($0, limit: 2048, reader: reader) },
                     check: { try RequestDiagnostics.checkCancellation() })
                 guard evidence == .confirmed else {
+                    diagnose(["kind": "application_menu_membership", "node": node,
+                              "retainedAncestors": read.ancestors.count,
+                              "result": evidence == .changed ? "changed" : "unavailable"])
                     throw DriverError(
                         "the selected item is no longer confirmed within the observed application menu",
                         code: evidence == .changed ? .staleTarget : .inputUnavailable)
@@ -390,29 +559,29 @@ import ApplicationServices
             // its role, identifier or value. The old registry scope is not
             // evidence of its current input boundary.
             let expected = try scope.requireWindow()
-            guard
-                let actual = WindowGeometry.owningWindow(
-                    read.element, pid: scope.application.processIdentifier, in: expected)
-            else {
-                throw DriverError("native target's current window membership is unavailable", code: .inputUnavailable)
-            }
-            let localMenu =
-                try attachedMenuAction && !CFEqual(actual, expected)
-                && LocalMenuAttachment.confirms(
-                    leaf: read.element, ancestors: read.ancestors, window: expected, same: { CFEqual($0, $1) },
-                    role: { AXAccess.read($0, kAXRoleAttribute).value as? String },
-                    children: { element in
-                        try RequestDiagnostics.checkCancellation()
-                        guard let children = AXAccess.elements(element, kAXChildrenAttribute, limit: 2048) else {
-                            throw DriverError("local menu attachment cannot be confirmed", code: .inputUnavailable)
-                        }
-                        return children
-                    })
-            guard CFEqual(actual, expected) || localMenu else {
-                throw DriverError("native target moved outside its observed interaction surface", code: .staleTarget)
-            }
+            let actual = WindowGeometry.owningWindow(
+                read.element, pid: scope.application.processIdentifier, in: expected)
+            // Local menus can omit AXWindow and sit beyond the bounded generic
+            // window search. An addressed action still has to prove every live
+            // forward edge of its retained menu path; the registry scope alone
+            // never authorizes input, and physical routes cannot use this proof.
+            try NativeInputMembershipBoundary.validate(
+                leaf: read.element, ancestors: read.ancestors, window: expected, currentWindow: actual,
+                attachedMenuAction: attachedMenuAction, same: { CFEqual($0, $1) },
+                role: { AXAccess.read($0, kAXRoleAttribute).value as? String },
+                children: { element in
+                    try RequestDiagnostics.checkCancellation()
+                    guard let children = AXAccess.elements(element, kAXChildrenAttribute, limit: 2048) else {
+                        throw DriverError("local menu attachment cannot be confirmed", code: .inputUnavailable)
+                    }
+                    return children
+                })
         }
         return (value, scope.blocked, node)
+    }
+
+    func windowKeyboardQueryScope(_ raw: Any?) throws -> NativeInputScope? {
+        try inputScope(raw)
     }
 
     func inputBinding(_ raw: Any?, input: Bool = false, attachedMenuAction: Bool = false) throws -> (
@@ -425,14 +594,9 @@ import ApplicationServices
                     "visual input requires this session's exact window image binding", code: .invalidRequest)
             }
             if target.isDesktopImage {
-                guard target.instance == nil, target.rootWindow == nil else {
-                    throw DriverError(
-                        "desktop input cannot contain application/window identities", code: .invalidRequest)
-                }
-                try desktopUnit(value).check()
-                return (value, [], nil)
+                throw DriverError("desktop images locate points; use explicit Computer input", code: .invalidRequest)
             }
-            let visual = try captures.input(value)
+            let visual = try captures.inputScope(value)
             return (value, visual.blocked, nil)
         }
         if (raw as? [String: Any])?["node"] is NSNull {
@@ -443,10 +607,141 @@ import ApplicationServices
         return (value.wire, value.blocked, value.node)
     }
 
-    func isDesktop(_ binding: [String: Any]) -> Bool { binding["surface"] is NSNull && binding["capture"] is String }
+    /// The original field remains the operation target. Only its proved
+    /// attached sheet may receive the unsent path suffix.
+    func savePanelPathBoundary(_ raw: Any?, proof: NativeSavePanelPathContinuation.Proof) throws -> [String] {
+        let requested = try NativeTarget(raw)
+        try requested.requireSession(session)
+        let original = try applications.readRoot(try string(requested.node, label: "node"))
+        guard CFEqual(original.element, proof.original), original.application.processIdentifier == proof.presenter.pid
+        else { throw DriverError("the SavePanel's original name field changed", code: .staleTarget) }
+        let scope = try inputScope(requested, canonicalize: false, observed: original)
+        try original.validate()
+        guard let window = scope.window, CFEqual(window, proof.panel), let graph = scope.windowEvidence,
+            NativeProcessIdentity.read(proof.presenter.pid) == proof.presenter,
+            NativeProcessIdentity.read(proof.service.pid) == proof.service
+        else { throw DriverError("the Go To sheet's original SavePanel scope changed", code: .staleTarget) }
+        return try proof.blocked(
+            in: graph.windows, root: string(requested.rootWindow, label: "rootWindow"),
+            focused: applications.focusedWindow(scope.application, windows: graph.windows))
+    }
 
-    func desktopUnit(_ binding: [String: Any]) throws -> NativeDesktopUnit {
-        NativeDesktopUnit(desktop: desktop(), ref: try string(binding["capture"], label: "capture"))
+    /// Only a selected Qt choice pointer consumes its two-path membership.
+    /// Ordinary AX and generic pointer boundaries retain their own rules.
+    func qtComboChoiceBoundary(_ raw: Any?, qualification proof: NativeQtComboChoice) throws -> [String] {
+        let requested = try NativeTarget(raw)
+        try requested.requireSession(session)
+        if requested.capture != nil {
+            guard requested.node == nil, let binding = raw as? [String: Any], proof.capturedPoint != nil else {
+                throw DriverError("Qt captured choice requires its original pixel binding", code: .invalidRequest)
+            }
+            let input = try captures.input(binding)
+            guard try proof.confirmsCaptured(input) else {
+                throw DriverError("the original captured Qt choice point changed", code: .staleTarget)
+            }
+            return input.blocked
+        }
+        guard proof.capturedPoint == nil else {
+            throw DriverError("Qt pixel proof cannot authorize an element intent", code: .invalidRequest)
+        }
+        let read = try applications.readRoot(try string(requested.node, label: "node"))
+        guard read.application.processIdentifier == proof.pid, CFEqual(read.element, proof.element),
+            let observed = NativeQtComboChoice.observationAnchor(
+                logicalSurface: read.observedInteractionSurface, ancestors: read.ancestors,
+                role: { AXAccess.read($0, kAXRoleAttribute).value as? String }),
+            CFEqual(observed, proof.observedWindow),
+            read.ancestors.count == proof.ancestors.count,
+            zip(read.ancestors, proof.ancestors).allSatisfy({ CFEqual($0.0, $0.1) })
+        else { throw DriverError("the selected Qt choice observation changed", code: .staleTarget) }
+        let scope = try inputScope(requested, canonicalize: false, observed: read, popupOwner: proof.ownerStamp?.owner)
+        try read.validate()
+        guard try proof.confirms() else {
+            throw DriverError("the original Qt choice popup membership changed", code: .staleTarget)
+        }
+        guard scope.blocked.isEmpty else { return scope.blocked }
+        if !CFEqual(proof.observedWindow, proof.popup), let graph = scope.windowEvidence,
+            NativePopupOwnerBoundary.hasKnownParentConflict(
+                popup: proof.popup, owner: proof.observedWindow,
+                windows: graph.windows.map {
+                    .init(ref: $0.ref, element: $0.element, parent: $0.parent, modal: $0.modal,
+                        parentUnknown: $0.parentUnknown)
+                }, same: { CFEqual($0, $1) })
+        {
+            throw DriverError("Qt popup has a confirmed different window owner", code: .staleTarget)
+        }
+        if let owner = proof.ownerStamp?.owner {
+            guard let graph = scope.windowEvidence else {
+                throw DriverError("Qt popup owner boundary evidence unavailable", code: .inputUnavailable)
+            }
+            return try NativePopupOwnerBoundary.blocked(
+                popup: proof.popup, owner: owner,
+                windows: graph.windows.map { .init(ref: $0.ref, element: $0.element, parent: $0.parent, modal: $0.modal) },
+                same: { CFEqual($0, $1) })
+        }
+        return []
+    }
+
+    /// Only NativeUnitBoundary's selected original-element HID contract can
+    /// enter here. General target(input:true) keeps its original membership.
+    func popupPointerBoundary(_ raw: Any?, qualification proof: NativePopupPointerQualification) throws -> [String] {
+        let requested = try NativeTarget(raw)
+        try requested.requireSession(session)
+        let read = try applications.readRoot(try string(requested.node, label: "node"))
+        guard read.application.processIdentifier == proof.pid, proof.context.process.pid == proof.pid else {
+            throw DriverError("the popup pointer process changed", code: .staleTarget)
+        }
+        guard let original = read.popupOwner, original.matches(proof.context, same: { CFEqual($0, $1) }),
+            CFEqual(read.element, proof.element)
+        else { throw DriverError("the original popup observation changed", code: .staleTarget) }
+        // A list uses its document as discovery hint. A split submenu is
+        // already the working surface; its reverse branch owner is separate.
+        let ownerHint = proof.context.kind == .list ? proof.context.owner : nil
+        let scope = try inputScope(requested, canonicalize: false, observed: read, popupOwner: ownerHint)
+        try read.validate()
+        guard scope.blocked.isEmpty else { return scope.blocked }
+        guard let graph = scope.windowEvidence else {
+            throw DriverError("popup owner window evidence unavailable", code: .inputUnavailable)
+        }
+        let unit = NativeElementPointerUnit(
+            application: scope.application, window: try scope.requireWindow(), element: read.element,
+            logicalWindow: read.observedInteractionSurface)
+        let current = WindowGeometry.owningWindow(
+            read.element, pid: unit.application.processIdentifier, in: unit.window)
+        let facts = NativePopupAXFacts(
+            pid: unit.application.processIdentifier, until: RequestDiagnostics.deadline ?? .infinity,
+            check: {
+                try RequestDiagnostics.checkCancellation()
+                if let until = RequestDiagnostics.deadline, ProcessInfo.processInfo.systemUptime >= until {
+                    throw RequestDeadlineExceeded()
+                }
+            }).facts()
+        return try NativePopupPointerBoundary.validate(
+            proof, original: read.popupOwner, leaf: read.element, ancestors: read.ancestors, popup: unit.window,
+            currentOwner: current, facts: facts, sample: { try unit.popupPhysicalSample(proof.geometry) },
+            same: { CFEqual($0, $1) }, ownerBoundary: { popup, owner in
+                return try NativePopupOwnerBoundary.blocked(
+                    popup: popup, owner: owner,
+                    windows: graph.windows.map { .init(ref: $0.ref, element: $0.element, parent: $0.parent, modal: $0.modal) },
+                    same: { CFEqual($0, $1) })
+            })
+    }
+
+    func popupPointerUnit(_ binding: [String: Any], qualification proof: NativePopupPointerQualification) throws
+        -> any NativePopupPointerInput
+    {
+        let target = try NativeTarget(binding)
+        try target.requireSession(session)
+        let read = try applications.readRoot(try string(target.node, label: "node"))
+        guard read.scope == target.surface, read.application.processIdentifier == proof.pid,
+            CFEqual(read.element, proof.element), let observed = read.observedInteractionSurface,
+            CFEqual(observed, proof.context.popup)
+        else { throw DriverError("popup pointer prototype changed", code: .staleTarget) }
+        // Construction follows the production final boundary and grants no
+        // input. Delivery will re-enter that boundary before every OS event.
+        let unit = NativeElementPointerUnit(
+            application: read.application, window: proof.context.popup, element: read.element,
+            logicalWindow: observed)
+        return NativePopupPointerUnit(element: unit, qualification: proof)
     }
 
     func receiverRelation(
@@ -463,6 +758,28 @@ import ApplicationServices
         return NativeReceiverRelation(
             editor: try applications.readRoot(editor).element,
             related: try applications.readRoot(receiver.reference).element, selection: receiver)
+    }
+
+    func actionContextUnit(_ binding: [String: Any], action: String) throws -> (any NativeApplicationContextInput)? {
+        guard action == kAXPressAction || action == kAXShowMenuAction else { return nil }
+        let scope = try inputScope(binding)
+        guard NativeObjectActionPolicy.applicationContextEligible(
+            action: action, hasWindow: scope.window != nil, applicationMenu: scope.menuRoot != nil)
+        else { return nil }
+        // The original registry/provider attachment establishes this host;
+        // AppKit target/action activity is not specific to Web content or role.
+        let node = try string(binding["node"], label: "node")
+        _ = try applications.readRoot(node)
+        return NativeApplicationContextUnit(application: scope.application)
+    }
+
+    func applicationKeyboardUnit(_ binding: [String: Any]) throws -> NativeApplicationKeyboardUnit? {
+        guard binding["node"] is NSNull, binding["rootWindow"] is NSNull, binding["capture"] is NSNull else {
+            return nil
+        }
+        let scope = try inputScope(binding)
+        guard scope.window == nil, let menu = scope.menuRoot else { return nil }
+        return .init(application: scope.application, menu: menu)
     }
 
     func keyboardUnit(
@@ -482,7 +799,8 @@ import ApplicationServices
             element: owned?.element ?? read?.element,
             receiverRelation: try receiverRelation(binding, actuator: actuator, receiver: receiver),
             cellEditorState: read?.cellEditorState, cellEditor: owned?.proof,
-            windowCommandScope: binding["node"] is NSNull)
+            windowCommandScope: binding["node"] is NSNull,
+            boundaryCoverageComplete: scope.windowEvidence?.coverageComplete == true)
     }
 
     func selectedTextUnit(
@@ -508,11 +826,18 @@ import ApplicationServices
         let node = try string(binding["node"], label: "node")
         let scrolling = actuator?.relation == "scrollPointer"
         let geometry = scrolling ? actuator!.region! : node
+        let read = try applications.readRoot(geometry)
+        // Use the same original-observation anchor as Qt offer sampling and
+        // final validation; generic nested-surface absence cannot erase it.
+        let combo = try actuator == nil ? NativeQtComboChoice.query(
+            element: read.element, role: AXAccess.read(read.element, kAXRoleAttribute).value as? String,
+            observedWindow: read.observedInteractionSurface, ancestors: read.ancestors,
+            pid: scope.application.processIdentifier) : nil
         return NativeElementPointerUnit(
-            application: scope.application, window: try scope.requireWindow(),
-            element: try applications.readRoot(geometry).element,
+            application: scope.application, window: try combo?.popup ?? scope.requireWindow(),
+            element: read.element,
             member: try actuator.map { try applications.readRoot($0.node).element }, kind: scrolling ? .scroll : .click,
-            logicalWindow: try applications.readRoot(geometry).observedInteractionSurface)
+            logicalWindow: read.observedInteractionSurface, qtComboChoice: combo)
     }
 
     func menuUnit(_ binding: [String: Any], within: [String] = []) throws -> NativeMenuUnit {
@@ -522,7 +847,11 @@ import ApplicationServices
         }
         return NativeMenuUnit(
             application: scope.application, window: scope.window, element: try applications.readRoot(node).element,
-            root: scope.menuRoot!, path: try (within + [node]).map { try applications.readRoot($0).element })
+            root: scope.menuRoot!, path: try (within + [node]).map { try applications.readRoot($0).element },
+            attachedDialogs: scope.window.flatMap {
+                NativeMenuAttachedDialogs.candidate(root: $0, evidence: scope.windowEvidence,
+                                                    pid: scope.application.processIdentifier)
+            })
     }
 
     func scrollUnit(_ binding: [String: Any], actuator: NativeInspectQuery.Actuator) throws -> NativeScrollUnit {
@@ -575,6 +904,11 @@ import ApplicationServices
         let surface = try string(scope.wire["surface"], label: "surface")
         guard observed.scope == surface, observed.application.isEqual(scope.owner) else {
             throw DriverError("observed node belongs to another UI scope", code: .staleTarget)
+        }
+        if directory.applicationRoot(surface)?.kind == .applicationContent {
+            _ = try directory.applicationRootScope(
+                instance: string(value.instance, label: "instance"), root: value.rootWindow,
+                surface: surface, containing: observed.element)
         }
         value.rootWindow = scope.wire["rootWindow"] as? String
         return (value.wire, node)

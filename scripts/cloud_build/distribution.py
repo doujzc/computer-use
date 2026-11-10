@@ -96,10 +96,12 @@ def artifact_name(root, target):
 
 
 def validate_backend(root, path, target, *, destination=None):
-    manifest = inspect_archive(path, target, destination=destination)
-    if manifest["fingerprint"] != fingerprint(root, target) or manifest["protocol"] != protocol_version(root):
-        raise ValueError(f"{target} backend does not match this checkout's native inputs/protocol.")
-    return manifest
+    return inspect_archive(
+        path,
+        target,
+        destination=destination,
+        expected_inputs=(fingerprint(root, target), protocol_version(root)),
+    )
 
 
 def _build_wheel(source, output):
@@ -177,6 +179,8 @@ def _assemble_platform(source, archive, staging, target):
     tag = WHEEL_PLATFORMS.get(target)
     if tag is None:
         raise ValueError(f"Unknown wheel platform: {target}")
+    environment = {**os.environ, "COMPUTER_USE_BACKEND_DIR": str(payload)}
+    environment.pop("COMPUTER_USE_BACKEND_ARCHIVE", None)
     subprocess.run(
         [
             sys.executable,
@@ -188,7 +192,7 @@ def _assemble_platform(source, archive, staging, target):
             f"--config-setting=--build-option=--plat-name={tag}",
             str(source),
         ],
-        env={**os.environ, "COMPUTER_USE_BACKEND_DIR": str(payload)},
+        env=environment,
         check=True,
     )
     (wheel,) = staging.glob("*.whl")
@@ -198,9 +202,9 @@ def _assemble_platform(source, archive, staging, target):
         if tags != [f"py3-none-{tag}"] or not wheel.name.endswith(f"-py3-none-{tag}.whl"):
             raise ValueError(f"Built wheel has the wrong platform tag for {target}.")
         prefix = "computer_use/_resources/"
-        installed = {name.removeprefix(prefix) for name in built.namelist() if name.startswith(prefix)}
+        installed = [name.removeprefix(prefix) for name in built.namelist() if name.startswith(prefix)]
         expected = {"manifest.json", *cache_manifest}
-        if installed != expected:
+        if len(installed) != len(expected) or set(installed) != expected:
             raise ValueError(f"Built wheel contains unexpected backend files for {target}.")
         for name in expected:
             info = built.getinfo(prefix + name)

@@ -7,7 +7,7 @@
 English | [简体中文](README_CN.md)
 
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-green.svg" alt="License" /></a>
-<img src="https://img.shields.io/badge/python-3.12%2B-blue.svg" alt="Python" />
+<img src="https://img.shields.io/badge/python-3.11%2B-blue.svg" alt="Python" />
 <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey.svg" alt="Platform" />
 
 </div>
@@ -18,7 +18,7 @@ Computer Use is the desktop-operation component of the openJiuwen Agent System S
 
 Developers can adopt it in two ways:
 
-**Option 1: integrate the computer_use engine.** Connect an agent through MCP or call the Python SDK directly. The MCP tool `computer_use(title, code)` runs Python against the `Computer → App / Window → Element` interface, with variables retained across calls. Agents use accessibility trees and screenshots to locate controls and verify operation results.
+**Option 1: integrate the computer_use engine.** Connect an agent through MCP or call the Python SDK directly. The MCP tool `computer_use(title, code)` runs Python against the `Computer → App → Element` interface, with variables retained across calls. Agents use accessibility trees and screenshots to locate controls and verify operation results.
 
 **Option 2: integrate the Computer Use DeepAgent.** Use the agent assembled on openJiuwen DeepAgent through its standard `invoke()`, `stream()` and `Runner` interfaces. Applications pass natural-language tasks to the agent, which observes the desktop, performs operations and checks their results.
 
@@ -56,15 +56,15 @@ flowchart TD
     OS --> Desktop["Desktop applications"]
 ```
 
-DeepAgent manages model calls, conversation context and the tool loop. The engine manages the `Computer → App / Window → Element` interfaces, target identity, observations and operation routing. OS adapters resolve native objects, prepare the input receiver and dispatch operations. Agents read the UI again to confirm task results after receiving `dispatched` or `verified` receipts.
+DeepAgent manages model calls, conversation context and the tool loop. The engine manages target identity, observations and operation routing. OS adapters prepare input receivers and dispatch operations.
 
 ## Features
 
 - **DeepAgent integration**: standard openJiuwen invocation, streaming and Runner integration, with computer-operation tools reusable in existing DeepAgent applications.
 - **Single-tool code execution**: the model writes Python, variables persist across calls, one call can complete a multi-step workflow.
 - **Accessibility-tree first**: elements are numbered by decimal refs; `element(path)` queries, paged text reads and menu reads are supported.
-- **Verifiable receipts**: every action returns `dispatched` / `verified`; failures are structured as `code / effect / next`.
-- **Shared and exclusive desktop modes**: background-window-directed input by default without stealing focus; foreground assistance on demand.
+- **Verifiable receipts**: dispatch and post-action observation are reported separately. Observations show diffs by default. Request screenshots explicitly.
+- **Background-first input**: App methods accept an optional `window=` scope. On macOS, direct Computer methods send global input.
 - **Cross-platform native drivers**: one each for macOS, Windows and Linux behind the same protocol.
 - **Observable**: every execution is journaled as JSONL under `~/.computer-use/logs`, including code, observations and receipts.
 
@@ -95,11 +95,12 @@ computer-use/
 
 - [MCP build, installation and integration](docs/mcp.en.md)
 - [DeepAgent build, installation and integration](docs/deepagent.en.md)
+- [Development packaging](PACKAGING.md)
 
 - [DeepAgent integration](computer_use_agent/agent.py): agent construction, standard invocation and conversation lifecycle.
 - [DeepAgent tools](computer_use_agent/toolkit.py): tools for existing openJiuwen applications.
-- [SDK API reference](computer_use_engine/__init__.pyi): public interfaces and parameter types for `Computer`, `App`, `Window` and `Element`.
-- [MCP server](interface_adapter/mcp/server.py): tool schemas, execution instructions and desktop-mode arguments.
+- [SDK API reference](computer_use_engine/__init__.pyi): public interfaces and parameter types for `Computer`, `App` and `Element`.
+- [MCP server](interface_adapter/mcp/server.py): tool schemas, execution instructions and global-input authorization.
 - [Native setup commands](scripts/native.py): platform builds, permission checks and Linux session setup.
 - [Direct conversation](computer_use_agent/cli/main.py): CLI options and interactive commands.
 

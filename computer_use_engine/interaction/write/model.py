@@ -26,12 +26,21 @@ if TYPE_CHECKING:
     from typing import Any
 
     from computer_use.interaction.records import ElementPath as LookupPath
-    from computer_use.interaction.write.routes.policy import RouteKey
+    from computer_use.interaction.write.routes.policy import ReceiverPair, RouteKey
     from computer_use.native.contracts import Binding
 
 
 if TYPE_CHECKING:
     from computer_use.native.lifecycle import OperationLease
+
+
+@dataclass(frozen=True)
+class RecordedStep:
+    """One attempted command and its native receipt, absent after interrupted I/O."""
+
+    command: UnitCommand
+    receipt: StepResult | None = None
+    failure_effect: str | None = None
 
 
 @dataclass(frozen=True)
@@ -91,7 +100,7 @@ class OperationSpec:
         intent: Requested operation and parameters.
         target: Pinned native identity for this write.
         within: Confirmed ancestor tokens constraining native input.
-        policy: Host desktop mode and foreground-assistance authorization.
+        policy: Host authorization for global mouse and keyboard input.
         forward_scope: Original container boundary for current-receiver forwarding.
     """
 
@@ -141,8 +150,9 @@ class AttemptView:
     Attributes:
         unavailable: Semantic routes refused for the rest of this write.
         background_unavailable: Routes whose background preparation was unavailable.
-        prepared: Route and foreground-mode pairs already prepared.
+        prepared: Route/mode preparation attempts consumed by this operation.
         precondition_changes: Number of pre-dispatch precondition changes consumed so far.
+        preparation_pairs: Recipients that have consumed this write's preparation allowance.
     """
 
     unavailable: frozenset[RouteKey] = frozenset()
@@ -151,6 +161,7 @@ class AttemptView:
     precondition_changes: int = 0
     click_refresh: RouteKey | None = None
     failed_steps: Mapping[RouteKey, int] = field(default_factory=dict)
+    preparation_pairs: frozenset[ReceiverPair] = frozenset()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "failed_steps", MappingProxyType(dict(self.failed_steps)))

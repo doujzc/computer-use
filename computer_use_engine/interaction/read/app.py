@@ -40,6 +40,7 @@ from computer_use.interaction.read.presentation.content import (
 )
 from computer_use.interaction.read.presentation.document import DisplayDocument
 from computer_use.native.contracts import Binding, Dispatch
+from computer_use.native.query.directory import SurfaceReadProfile
 from computer_use.native.scopes import (
     RunningApplication,
     SelectedApplicationWindow,
@@ -69,6 +70,7 @@ if TYPE_CHECKING:
     from computer_use.interaction.read.presentation.records import RenderedTree
     from computer_use.interaction.records import Remaining
     from computer_use.native.port import NativePort
+    from computer_use.native.scopes import PendingApplicationLaunch
     from computer_use.pipeline.core import Control, T
     from computer_use.protocol.records import ApplicationInfo
     from computer_use.protocol.records import NativeDirectory as DirectoryFacts
@@ -81,7 +83,6 @@ def failure(code: str, detail: str) -> ComputerUseError:
             effect="none",
             target="working window",
             detail=detail,
-            next="read the window directory again; explicitly select a working window if needed",
         )
     )
 
@@ -152,7 +153,16 @@ class NativeAppReader:
         self.overviews = NativeOverview(port)
         self.menus = NativeMenus(self.directory, self.reader)
         self._window_references = None
+        self.window_registry = None
         self._element_references = None
+        # The reader owns a driver session. Recovery survives temporary App
+        # wrapper lifetimes and is keyed by the retained installation.
+        self.pending_launches: dict[str, PendingApplicationLaunch] = {}
+
+    def pending_launch(self, selector: str) -> PendingApplicationLaunch | None:
+        return self.pending_launches.get(selector) or next(
+            (item for item in self.pending_launches.values() if selector in item.selectors), None
+        )
 
     def number_snapshots(
         self, snapshots: Iterable[SemanticSnapshot], *, _control: Control | None = None
@@ -174,6 +184,8 @@ class NativeAppReader:
         return number_snapshots(snapshots, self._element_references, _control=_control)
 
     def window_aliases(self, directory: DirectoryFacts) -> dict[str, str]:
+        if self.window_registry is not None:
+            return self.window_registry.register_directory(directory)
         if self._window_references is None or self._window_references.session != directory["session"]:
             self._window_references = DisplayReferences(directory["session"])
         return {
@@ -189,7 +201,7 @@ class NativeAppReader:
         *,
         window: str | None = None,
         fields: list[str] | None = None,
-        max_nodes: int = 1000,
+        max_nodes: int | None = None,
         max_depth: int | None = None,
         max_dimension: int = 2048,
         timeout_ms: int = 30000,
@@ -198,12 +210,17 @@ class NativeAppReader:
         on_scope: Callable[[RunningApplication | WorkingWindow], None] | None = None,
         view: str = "both",
         overview: bool = True,
+        source_directory: DirectoryFacts | None = None,
+        scope_managed: bool = False,
+        include_menus: bool = True,
+        source_applications: DirectoryFacts | None = None,
     ) -> AppObservation | MenuAppObservation:
         """Read an application through request, acquisition and delivery pipelines.
 
         Args:
             fields: Requested or accounted native fields; unknown fields remain explicit facts.
-            max_nodes: Maximum number of native objects this collection may read.
+            max_nodes: Maximum native objects to collect; None uses the selected
+                window or menu branch's default.
             max_depth: Maximum native relation depth; None uses the existing platform default.
             max_dimension: Maximum image edge length in pixels, preserving aspect ratio.
             timeout_ms: Maximum duration in milliseconds, bounded by the enclosing call deadline.
@@ -212,6 +229,11 @@ class NativeAppReader:
             on_scope: Callback that retains the established running/working scope in its
                 existing owner.
             view: Requested observation components: tree, image, or both.
+            source_directory: Directory just resolved for this fixed working window.
+            scope_managed: The enclosing interface owns member discovery and final presentation;
+                retain numbered components without an inner scope recollection or duplicate projection.
+            include_menus: Collect the optional application menu summary after window content.
+            source_applications: Catalogue that selected the installation before the startup branch.
         """
         from computer_use.interaction.read.app_read.model import ReadRequest
         from computer_use.interaction.read.pipeline import ApplicationObservationPipeline
@@ -229,6 +251,10 @@ class NativeAppReader:
             on_scope,
             view,
             overview,
+            source_directory,
+            scope_managed,
+            include_menus,
+            source_applications,
         )
         return await ApplicationObservationPipeline(self).arun(request)
 
@@ -243,6 +269,7 @@ class NativeAppReader:
         selection: WorkingWindow | None = None,
         _control: Control | None = None,
         include_overview: bool = True,
+        profile: SurfaceReadProfile = SurfaceReadProfile.ACCESSIBILITY,
     ) -> WindowSelectionRequired:
         """Build a selection response when the read cannot choose one working window.
 
@@ -262,7 +289,7 @@ class NativeAppReader:
 
         control = _control or self.port.calls.control(remaining)
         return await WindowChoicePipeline(self).arun(
-            WindowChoiceRequest(error, application, name, directory, selection, include_overview),
+            WindowChoiceRequest(error, application, name, directory, selection, include_overview, profile),
             control.with_remaining(remaining),
         )
 
@@ -322,7 +349,10 @@ class NativeAppReader:
 
         control = _control or self.port.calls.control(remaining)
         return await WorkingScopeDiscoveryPipeline(self).arun(
-            WorkingScopeRequest(selection, accessibility), control.with_remaining(remaining)
+            WorkingScopeRequest(
+                selection, SurfaceReadProfile.ACCESSIBILITY if accessibility else SurfaceReadProfile.VISUAL
+            ),
+            control.with_remaining(remaining),
         )
 
     async def _startup_directory(
@@ -334,6 +364,7 @@ class NativeAppReader:
         launched: bool,
         installation: str | None = None,
         on_scope: Callable[[RunningApplication | WorkingWindow], None] | None = None,
+        profile: SurfaceReadProfile = SurfaceReadProfile.ACCESSIBILITY,
         _control: Control | None = None,
     ) -> tuple[ApplicationInfo, DirectoryFacts]:
         """Observe the running scope associated with an application startup.
@@ -351,12 +382,12 @@ class NativeAppReader:
 
         control = _control or self.port.calls.control(remaining)
         return await StartupDirectoryPipeline(self).arun(
-            StartupDirectoryState(application, session, launched, installation, on_scope),
+            StartupDirectoryState(application, session, launched, installation, on_scope, profile=profile),
             control.with_remaining(remaining),
         )
 
     @staticmethod
-    def _selection(
+    def select_working_window(
         application: str,
         name: str,
         directory: DirectoryFacts,
@@ -377,23 +408,35 @@ class NativeAppReader:
             The existing working scope, or a scope anchored to the resolved root.
         """
         if root_id is not None and not any(item["window"] == root_id for item in directory["surfaces"]):
+            absence_is_unknown = directory["stopReasons"] or directory["platform"] in ("macos", "windows")
             if previous is not None:
                 from computer_use.native.scopes import FixedWindowInvalidated, FixedWindowUnconfirmed
 
-                if directory["stopReasons"]:
-                    raise FixedWindowUnconfirmed(previous.root)
+                explicitly_ended = any(
+                    (item["window"], item["surface"], item["instance"])
+                    == (previous.root.root_window, previous.root.surface, previous.root.instance)
+                    for item in directory.get("endedWindows", ())
+                )
+                if not explicitly_ended and absence_is_unknown:
+                    raise FixedWindowUnconfirmed(previous.root, directory=directory)
                 raise FixedWindowInvalidated(
-                    previous.root, "The fixed working window is absent from the complete current directory."
+                    previous.root,
+                    "The fixed working window lifetime ended.",
+                    directory=directory,
                 )
             raise failure(
-                "observation_incomplete" if directory["stopReasons"] else "stale_target",
+                "observation_incomplete"
+                if absence_is_unknown
+                else "stale_target",
                 "The fixed working window is missing from the current directory; another document was not selected.",
             )
         root = window_binding(select_surface(directory, root_id, follow_modal=False))
         if previous is not None and previous.root != root:
             from computer_use.native.scopes import FixedWindowInvalidated
 
-            raise FixedWindowInvalidated(previous.root, "The fixed working-window identity changed.")
+            raise FixedWindowInvalidated(
+                previous.root, "The fixed working-window identity changed.", directory=directory
+            )
         return previous or WorkingWindow(application, name, root)
 
     @staticmethod
@@ -421,7 +464,7 @@ class NativeAppReader:
                 detail=detail
                 + " Observation failed: "
                 + (error.detail if isinstance(error, ComputerUseError) else str(error)),
-                next="read the same App again; inspect list_apps() before requesting another launch",
+                impact=error.impact if isinstance(error, ComputerUseError) else None,
             ),
             cause=error,
         )
@@ -477,7 +520,6 @@ class NativeAppReader:
                 "directory",
                 "observation_incomplete",
                 reason,
-                "inspect the directory again if the required window is missing",
             )
             for reason in directory["stopReasons"]
         ]
@@ -487,7 +529,6 @@ class NativeAppReader:
                     "directory",
                     "observation_incomplete",
                     "Some window parent relationships are unknown.",
-                    "select an observed window explicitly when needed",
                 )
             )
         return gaps
@@ -560,11 +601,9 @@ class NativeAppReader:
         if matches_scope_confirmed_condition:
             lines.append(
                 template(
-                    "Interaction: the application reports focus in window {}; "
-                    "this view is window {}. Use app.window({}).read() to inspect that window if relevant to the task.",
+                    "Reported focused window: {}; observed window: {}.",
                     aliases[focused],
                     aliases[selected["window"]],
-                    quoted(aliases[focused]),
                 )
             )
         lines.append("Tree: full" if prepared is not None else "Tree: unavailable")
@@ -575,17 +614,14 @@ class NativeAppReader:
             )
             lines.extend(template("Image note: {}", quoted(note)) for note in window_state_summary(metadata))
             if image_precedes_tree:
-                lines.append("The screenshot was captured before the refreshed tree; their contents may differ.")
+                lines.append("Capture order: screenshot, then refreshed tree.")
         else:
             lines.append("Screenshot: unavailable")
         if not scope_confirmed:
-            lines.append("Current view is not confirmed; components describe the observed view.")
+            lines.append("Current window selection: unknown.")
         if prepared is not None:
             lines.append(prepared if isinstance(prepared, DisplayDocument) else DisplayDocument.tree(prepared))
-        lines.extend(
-            template("{}: {}: {}; next: {}", gap.component, gap.code, quoted(gap.detail), quoted(gap.next))
-            for gap in gaps
-        )
+        lines.extend(template("{}: {}: {}", gap.component, gap.code, quoted(gap.detail)) for gap in gaps)
         return DisplayDocument.join(lines)
 
     @staticmethod

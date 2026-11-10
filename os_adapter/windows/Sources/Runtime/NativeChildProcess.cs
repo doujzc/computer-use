@@ -11,8 +11,10 @@ namespace ComputerUse.Windows
 {
     // One bounded child, no UIA objects or abandoned native-call threads in
     // the supervising process. Closing the job also contains capture helpers.
-    internal sealed class NativeChildProcess : IDisposable
+    internal sealed class NativeChildProcess : INativeWorkerProcess
     {
+        internal const int StopConfirmationMs = 1000;
+
         [StructLayout(LayoutKind.Sequential)]
         struct BasicLimits
         {
@@ -49,7 +51,19 @@ namespace ComputerUse.Windows
         readonly Process process;
         readonly IntPtr job;
         readonly StreamWriter input;
-        bool disposed;
+        bool disposed, started, exitConfirmed;
+        public bool ExitConfirmed
+        {
+            get {
+                return exitConfirmed || !started;
+            }
+        }
+        internal int ProcessId
+        {
+            get {
+                return process.Id;
+            }
+        }
         Task<string> pending;
         internal NativeChildProcess(string argument, string executable = null)
         {
@@ -63,28 +77,18 @@ namespace ComputerUse.Windows
                 throw new Failure("observation_unavailable", "cannot create an isolated native worker job");
             }
 
-            process = new Process
-            {
-                StartInfo = new ProcessStartInfo
-                {
-                    FileName = executable ?? System.Reflection.Assembly.GetExecutingAssembly().Location,
-                    Arguments = argument,
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                    RedirectStandardInput = true,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    StandardOutputEncoding = new UTF8Encoding(false),
-                    StandardErrorEncoding = new UTF8Encoding(false)
-                }
-            };
+            process = new Process { StartInfo = new ProcessStartInfo {
+                FileName = executable ?? System.Reflection.Assembly.GetExecutingAssembly().Location,
+                Arguments = argument, UseShellExecute = false, CreateNoWindow = true, RedirectStandardInput = true,
+                RedirectStandardOutput = true, RedirectStandardError = true,
+                StandardOutputEncoding = new UTF8Encoding(false), StandardErrorEncoding = new UTF8Encoding(false)
+            } };
             try
             {
                 process.Start();
-                input = new StreamWriter(process.StandardInput.BaseStream, new UTF8Encoding(false))
-                {
-                    AutoFlush = true
-                };
+                started = true;
+                input =
+                    new StreamWriter(process.StandardInput.BaseStream, new UTF8Encoding(false)) { AutoFlush = true };
                 // The worker waits for its bootstrap frame before doing work.
                 if (!AssignProcessToJobObject(job, process.Handle))
                     throw new IOException("native worker job assignment failed");
@@ -101,13 +105,11 @@ namespace ComputerUse.Windows
                 throw;
             }
         }
-
-        internal void Send(object value)
+        public void Send(object value)
         {
             input.WriteLine(Wire.Json(value));
         }
-
-        internal string Poll(int milliseconds)
+        public string Poll(int milliseconds)
         {
             if (pending == null)
                 pending = process.StandardOutput.ReadLineAsync();
@@ -121,34 +123,61 @@ namespace ComputerUse.Windows
                 throw new IOException("isolated native worker frame exceeded its budget");
             return line;
         }
-
-        internal bool Stop(int grace = 0)
+        bool ConfirmExit(int wait = 0)
         {
-            if (disposed)
+            if (exitConfirmed || !started)
                 return true;
+            if (disposed)
+                return false;
             try
             {
-                if (process.HasExited)
+                if (process.HasExited || wait > 0 && process.WaitForExit(wait))
+                {
+                    exitConfirmed = true;
                     return true;
-                if (input != null)
-                    input.Close();
-                if (grace > 0 && process.WaitForExit(grace))
-                    return true;
-                process.Kill();
-                return process.WaitForExit(1000);
+                }
             }
             catch (InvalidOperationException)
             {
-                return true;
             }
             catch (System.ComponentModel.Win32Exception)
             {
+            }
+            return false;
+        }
+        public bool Stop(int grace = 0)
+        {
+            if (ConfirmExit())
+                return true;
+            if (disposed)
                 return false;
+            // A broken input pipe must not bypass termination of the owned child.
+            try
+            {
+                if (input != null)
+                    input.Close();
             }
             catch (IOException)
             {
-                return false;
             }
+            catch (ObjectDisposedException)
+            {
+            }
+            if (grace > 0 && ConfirmExit(grace))
+                return true;
+            try
+            {
+                process.Kill();
+            }
+            catch (InvalidOperationException)
+            {
+                return ConfirmExit();
+            }
+            catch (System.ComponentModel.Win32Exception)
+            {
+                return ConfirmExit();
+            }
+            return ConfirmExit(StopConfirmationMs);
         }
 
         public void Dispose()
@@ -163,6 +192,8 @@ namespace ComputerUse.Windows
             {
                 if (job != IntPtr.Zero)
                     CloseHandle(job);
+                // Job close is containment, not evidence: wait for this process.
+                ConfirmExit(StopConfirmationMs);
                 process.Dispose();
                 disposed = true;
             }

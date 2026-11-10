@@ -13,7 +13,7 @@ if TYPE_CHECKING:
     from computer_use.native.contracts import Binding, Intent, OperationTarget
     from computer_use.session.interface_images import CapturedWindow, InterfaceImage
     from computer_use.session.interfaces import InstanceState, WindowIdentity
-    from computer_use.types import ActionResult, AppInfo, Observation, TextPage
+    from computer_use.types import ActionResult, AppInfo, Observation, TextPage, WindowCatalogue
 
 Remaining: TypeAlias = Callable[[], int]
 """Return milliseconds left on the original call, or raise on expiration."""
@@ -43,15 +43,17 @@ class ElementSnapshot(TypedDict):
     text: CapturedField | None
     children: ChildContinuation | None
     window_identity: NotRequired[WindowIdentity]
+    menu_window_identity: NotRequired[WindowIdentity | None]
+    native_window_outside: NotRequired[bool]
 
 
 class UIHandle(Protocol):
-    """App/Window state needed to translate public UI operations.
+    """App/window state needed to translate public UI operations.
 
     Attributes:
         _instance: Shared instance membership, element references, and window views.
         _anchor: Fixed window key for a Window, or None for the App-wide view.
-        _context: Most recently confirmed member window for unqualified input.
+        _context: Proposed observation primary; publication commits actual delivered context.
         _lookup_scopes: Additional observed owners used for application-menu lookup.
         _menu_only: Whether the current view contains only an application menu.
         _image: Captured image context retained for this UI view.
@@ -63,14 +65,6 @@ class UIHandle(Protocol):
     _lookup_scopes: tuple[object, ...]
     _menu_only: bool
     _image: InterfaceImage | None
-
-
-class WindowHandle(Protocol):
-    """Link from a fixed Window view to its containing App handle."""
-
-    @property
-    def _app(self) -> UIHandle:
-        pass
 
 
 class ObservedWindow(Protocol):
@@ -97,6 +91,6 @@ WriteArguments: TypeAlias = (
 """Existing write entry tuples; the final flag requests current-target input."""
 
 if TYPE_CHECKING:
-    AgentResult: TypeAlias = Observation | ActionResult | TextPage | ElementSnapshot | list[AppInfo]
+    AgentResult: TypeAlias = Observation | ActionResult | TextPage | ElementSnapshot | list[AppInfo] | WindowCatalogue
     QueryResult: TypeAlias = ElementSnapshot
     InteractionResult: TypeAlias = AgentResult | ActionResult | QueryResult

@@ -10,13 +10,14 @@ from computer_use_linux.windowing.desktop import connect_desktop, coordination_i
 
 
 class NativeBackend:
-    def __init__(self, mode, stopped):
-        self.mode, self.stopped = mode, stopped
+    def __init__(self, allow_global_input, stopped):
+        require(allow_global_input is True or allow_global_input is False, "Global input permission must be a boolean.")
+        self.allow_global_input, self.stopped = allow_global_input, stopped
         self.registry = Registry()
         self.clipboard = None
         self.ax = NativeAccessibility()
         try:
-            self.desktop = connect_desktop(self.ax, mode, self.registry.retire)
+            self.desktop = connect_desktop(self.ax, self.registry.retire, allow_global_input=allow_global_input)
         except Exception:
             self.ax.close()
             raise
@@ -34,7 +35,7 @@ class NativeBackend:
         require(
             getattr(self.desktop, "session_type", None) == "x11",
             "This desktop has no implemented clipboard paste route.",
-            "mode_unsupported",
+            "unsupported_operation",
         )
         if self.clipboard is None:
             from computer_use_linux.control.native_clipboard import NativeClipboard

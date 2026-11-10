@@ -24,6 +24,7 @@ from computer_use.interaction.read.presentation.content import (
     text,
 )
 from computer_use.native.contracts import Binding
+from computer_use.protocol.records import relation_end
 
 if TYPE_CHECKING:
     from typing import Iterable
@@ -80,7 +81,7 @@ class ContentPages:
                 replace(target, node=relation["source"], capture=None),
                 selector,
                 relation["cursor"],
-                relation.get("offset", 0) + len(relation["targets"]),
+                relation_end(relation),
                 relation["total"],
             )
             if page in self._aliases:
@@ -112,7 +113,6 @@ class ContentPages:
                     effect="none",
                     target="element content",
                     detail="This continuation is expired or belongs to a different element or window.",
-                    next="read the intended element again and use a continuation printed in that result",
                 )
             )
         return dict(property=page.property, cursor=page.cursor, limit=128)
@@ -160,8 +160,9 @@ class ContentPages:
         inline_children: Iterable[str] = (),
         public_api: bool = False,
         children_only: bool = False,
+        concise: bool = False,
     ) -> DisplayText:
-        """Capture continuation aliases and commands as structured fields for final rendering."""
+        """Capture continuation aliases and offsets for final rendering."""
         refs = {node: ref for ref, node in tree.refs.items()}
         lines = []
         inline_children = set(inline_children) if compact else set()
@@ -179,7 +180,7 @@ class ContentPages:
                 replace(target, node=relation["source"], capture=None),
                 selector,
                 relation["cursor"],
-                relation.get("offset", 0) + len(relation["targets"]),
+                relation_end(relation),
                 relation["total"],
             )
             alias = self._aliases.get(page)
@@ -193,31 +194,40 @@ class ContentPages:
                 continue
             if alias is not None:
                 if public_api:
-                    lines.append(
-                        template(
-                            "{0} {1}, continuation: node = await app.element({0}); await node.read(cursor={2})",
-                            ref,
-                            label,
-                            json_value(alias),
+                    if concise and compact:
+                        lines.append(
+                            template(
+                                "{1} [{0}]: cursor={2} (live order)",
+                                ref,
+                                "Children" if label == "children" else label,
+                                json_value(alias),
+                            )
                         )
-                    )
+                    else:
+                        lines.append(
+                            template(
+                                "{0} {1}: cursor={2} (live order)",
+                                ref,
+                                label,
+                                json_value(alias),
+                            )
+                        )
                     continue
                 lines.append(
                     template(
-                        '{0} {1}, next offset {2} of {3}: app.element({4}).read({{"cursor": {5}}})',
+                        "{0} {1}: next offset {2} of {3}; cursor={4} (live order)",
                         ref,
                         label,
                         page.offset,
                         page.total,
-                        json_value(ref),
                         json_value(alias),
                     )
                 )
             else:
-                lines.append(template("{0} {1}: continuation expired; read this element again.", ref, label))
-        return (
-            text("") if not lines else join(("\nContinue reading (live order; changed prefixes expire):", join(lines)))
-        )
+                lines.append(template("{0} {1}: continuation expired.", ref, label))
+        if concise and compact and public_api:
+            return text("") if not lines else join(("\n", join(lines)), separator="")
+        return text("") if not lines else join(("\nContinuations:", join(lines)))
 
 
 if TYPE_CHECKING:

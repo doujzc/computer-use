@@ -12,9 +12,6 @@ struct NativeUnitBoundary {
         }
     let checkSelection: @MainActor () throws -> Void
     let markDispatchInFlight: @MainActor () throws -> Void
-    /// Scoped keyboard validates selection before its final receiver read.
-    let checkKeyboardSelection: @MainActor () throws -> Void
-    let markPreparedKeyboardDispatchInFlight: @MainActor () throws -> Void
     let beforeDispatch: @MainActor () throws -> Void
     /// Same-actor guard/mark callbacks are consumed immediately by the chosen unit.
     @MainActor static func make(
@@ -44,6 +41,22 @@ struct NativeUnitBoundary {
         }
         @MainActor func checkBoundary() throws {
             try checkBoundaryScope {
+                if let proof = contract.click?.popupPointer {
+                    guard case .pointer(.click) = contract.unit, contract.actuator == nil, contract.receiver == nil,
+                        binding.node != nil, !(binding.wire["capture"] is String), !command.foreground,
+                        contract.click?.delivery == .windowDirected,
+                        NativePopupClickPolicy.permitsIntent(op.request)
+                    else { throw DriverError("popup point qualification used by another route", code: .invalidRequest) }
+                    return try access.scopes.popupPointerBoundary(command.value["target"], qualification: proof)
+                }
+                if let proof = contract.click?.qtComboChoice {
+                    guard case .pointer(.click) = contract.unit, contract.actuator == nil, contract.receiver == nil,
+                        (binding.node != nil && proof.capturedPoint == nil && !(binding.wire["capture"] is String))
+                            || (binding.node == nil && proof.capturedPoint != nil && binding.wire["capture"] is String),
+                        contract.click!.delivery == .windowDirected
+                    else { throw DriverError("Qt choice proof used by another route", code: .invalidRequest) }
+                    return try access.scopes.qtComboChoiceBoundary(command.value["target"], qualification: proof)
+                }
                 let attachedMenuAction: Bool
                 if case .action = contract.unit { attachedMenuAction = true } else { attachedMenuAction = false }
                 return try access.scopes.inputBinding(
@@ -54,29 +67,15 @@ struct NativeUnitBoundary {
         @MainActor func checkSelection() throws {
             try access.contracts.selectionBasis(op.token).check(
                 contract.basis,
-                scope: access.scopes.isDesktop(binding.wire)
-                    ? access.desktop().scope : string(binding.wire["surface"], label: "surface"))
+                scope: string(binding.wire["surface"], label: "surface"))
         }
-        var keyboardSelectionChecked = false
-        @MainActor func checkKeyboardSelection() throws {
-            if receipt.dispatch == "notDispatched" {
-                try checkSelection()
-                keyboardSelectionChecked = true
-            }
-        }
-        @MainActor func markPreparedKeyboardDispatch() throws {
-            guard receipt.dispatch != "notDispatched" || keyboardSelectionChecked else {
-                throw DriverError("scoped keyboard selection admission was not prepared", code: .invalidRequest)
-            }
-            try markDispatch(checkSelectionFirst: false)
-            keyboardSelectionChecked = false
-        }
-        @MainActor func markDispatch(checkSelectionFirst: Bool = true) throws {
+        @MainActor func markDispatch() throws {
             try op.check(write: true)
-            if checkSelectionFirst && receipt.dispatch == "notDispatched" { try checkSelection() }
+            if receipt.dispatch == "notDispatched" { try checkSelection() }
             try RequestDiagnostics.checkCancellation()
             receipt.dispatch = "unknown"
             op.recordInputDispatch()
+            receipt.appChangeInputBaseline = op.appChangeInputBaseline
             access.recordEffect()
         }
         @MainActor func beforeDispatch() throws {
@@ -86,8 +85,7 @@ struct NativeUnitBoundary {
         return NativeUnitBoundary(
             checkConditions: checkBoundary, keyboardDispatchCheck: { sample in { try checkBoundaryScope(sample) } },
             checkSelection: checkSelection, markDispatchInFlight: { try markDispatch() },
-            checkKeyboardSelection: checkKeyboardSelection,
-            markPreparedKeyboardDispatchInFlight: markPreparedKeyboardDispatch, beforeDispatch: beforeDispatch)
+            beforeDispatch: beforeDispatch)
 
     }
 }

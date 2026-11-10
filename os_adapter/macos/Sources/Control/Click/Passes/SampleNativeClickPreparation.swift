@@ -5,6 +5,10 @@ import ApplicationServices
 
 /// QUERY: sample geometry and readiness of the selected pointer delivery only.
 @MainActor enum SampleNativeClickPreparationPass {
+    static func needed(_ offer: NativeClickContract, pointerReady: Bool, foreground: Bool) -> Bool {
+        !pointerReady || offer.requiresForegroundGeometry && !foreground
+    }
+
     static func run(_ plan: NativeClickPlan, boundary: NativeUnitBoundary, afterPreparation: Bool = false) throws
         -> NativeClickWindowPreparation?
     {
@@ -12,34 +16,40 @@ import ApplicationServices
         defer { metric?.end() }
         try boundary.checkConditions()
         let pointer: NativePointerUnit, point: CGPoint
+        var kind: NativePointerIntent.Kind = .click
+        var elementGeometry: NativeElementPointerUnit.Geometry?
         switch plan.target {
         case .captured(let unit):
-            pointer = unit
-            point = try unit.point(plan.pointer!.start!)
+            pointer = try unit.resolvingCaptureTranslation()
+            point = try pointer.point(plan.pointer!.start!)
         case .element(let unit):
-            if !afterPreparation, let exposure = try unit.exposure() {
-                pointer = NativePointerUnit(
-                    application: unit.application, window: exposure.mapping, nativeWindow: unit.window)
+            let viewport = try afterPreparation ? nil : unit.viewport()
+            if let exposure = viewport?.exposure {
+                pointer = unit.exposurePointerUnit(exposure)
                 point = exposure.point
+                // Exposure addresses a passive wheel receiver. A click/key
+                // receiver is prepared only after the target becomes visible.
+                kind = .scroll
             } else {
-                let geometry = try afterPreparation ? unit.geometry() : unit.preparationGeometry()
-                pointer = NativePointerUnit(
-                    application: unit.application, window: geometry.mapping, nativeWindow: unit.window)
+                let geometry = try viewport.map { try unit.preparationGeometry(in: $0) } ?? unit.geometry()
+                pointer = unit.pointerUnit(mapping: geometry.mapping)
                 point = geometry.point
+                elementGeometry = geometry
             }
         default: return nil
         }
         try pointer.validateWindowIdentity()
         try BackgroundTarget(pointer.application).validate(input: true)
-        try BackgroundTarget.validateReleasedInput()
         if plan.offer.delivery == .windowDirected {
-            guard !BackgroundTarget.isExclusive else {
-                throw DriverError("window-directed clicks are unavailable in exclusive mode", code: .modeUnsupported)
-            }
             try BackgroundEvents.requirePointerRoute(window: pointer.window)
         }
-        let needed = !pointer.ready(at: point, delivery: plan.offer.delivery)
-        try boundary.checkConditions()
-        return NativeClickWindowPreparation(pointer: pointer, point: point, needed: needed)
+        let needed = needed(
+            plan.offer, pointerReady: pointer.ready(at: point, kind: kind, delivery: plan.offer.delivery),
+            foreground: !plan.offer.requiresForegroundGeometry || pointer.foregroundWindow(at: point))
+        // These synchronous queries have no preparation effect or suspension.
+        // The selected preparation/event checks its own live boundary next.
+        try RequestDiagnostics.checkCancellation()
+        return NativeClickWindowPreparation(
+            pointer: pointer, point: point, needed: needed, kind: kind, elementGeometry: elementGeometry)
     }
 }

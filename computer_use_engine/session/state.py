@@ -23,6 +23,7 @@ class AppState:
         selection: Fixed working-window selection, when established.
         observation: Latest snapshot, whose structure is defined by the read branch.
         query_target: Exact native scope for subsequent element lookup.
+        query_snapshot: Latest facts for bounded post-input change observation, never an input authority.
         query_scope_kind: Native scope kind associated with that query target.
         directory: Last observed window catalogue, or None before observation.
         refs: Retained read-owned element snapshots, indexed by display number.
@@ -30,6 +31,7 @@ class AppState:
         delivered: Capture identity and delivery epoch, when delivered to the model.
         delivered_pixels: Exact window identity, digest, and delivery epoch.
         capture_expired: Whether the delivered image's coordinate mapping has expired.
+        delivered_coordinates: Model-image pixels mapped to the retained window PNG.
     """
 
     selector: str
@@ -38,13 +40,18 @@ class AppState:
     # Captured observation is opaque here: the read branch owns its definition.
     observation: object | None = None
     query_target: Binding | None = None
+    # Latest facts for this exact query window, used only to recognize an
+    # unchanged first observation after input. It never supplies input authority.
+    query_snapshot: SemanticSnapshot | None = None
     query_scope_kind: str | None = None
+    menu_window_identity: WindowIdentity | None = None
     directory: DirectoryFacts | None = None
     refs: OrderedDict[str, Record] = field(default_factory=OrderedDict)
     windows: dict[str, str] = field(default_factory=dict)
     delivered: tuple[str | None, int] | None = None
     delivered_pixels: tuple[Binding, bytes, int] | None = None
     capture_expired: bool = False
+    delivered_coordinates: ImageCoordinates | None = None
 
     @property
     def application(self):
@@ -56,5 +63,8 @@ class AppState:
 
 
 if TYPE_CHECKING:
+    from computer_use.interaction.read.facts.snapshot import SemanticSnapshot
     from computer_use.protocol.records import NativeDirectory as DirectoryFacts
     from computer_use.protocol.records import Record
+    from computer_use.session.image_coordinates import ImageCoordinates
+    from computer_use.session.interfaces import WindowIdentity

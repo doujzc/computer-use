@@ -10,7 +10,9 @@ from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, cast
 
 from computer_use.errors import ComputerUseError
+from computer_use.identity import FrozenRecord, freeze_result
 from computer_use.interaction.control import scope_control
+from computer_use.interaction.write.impact import action_impact, invoked_ax_menu_target
 from computer_use.interaction.write.model import OpenedWrite
 from computer_use.interaction.write.passes.complete_empty_input import stage as complete_empty_input
 from computer_use.interaction.write.passes.format_write_result import stage as format_write_result
@@ -27,7 +29,7 @@ from computer_use.interaction.write.progress import WriteRunState, failure
 from computer_use.interaction.write.resolution.pipeline import TargetResolutionPipeline
 from computer_use.interaction.write.routes.pipeline import RouteExecutionPipeline, RouteSelectionPipeline
 from computer_use.native.contracts import Dispatch
-from computer_use.pipeline import Repeat, Scope, Select, Sequence
+from computer_use.pipeline import Done, Repeat, Scope, Select, Sequence
 
 if TYPE_CHECKING:
     from typing import AsyncIterator
@@ -37,7 +39,7 @@ if TYPE_CHECKING:
     from computer_use.interaction.write.model import AttemptOutcome, BoundWrite, WriteRequest
     from computer_use.native.contracts import Intent, OperationTarget
     from computer_use.native.port import NativePort
-    from computer_use.pipeline.core import Continue, Control, Done
+    from computer_use.pipeline.core import Continue, Control
     from computer_use.protocol.records import Record
 
 
@@ -58,6 +60,9 @@ class WritePipeline:
 
     def __init__(self, native: NativePort) -> None:
         self.native, self.state = native, WriteRunState()
+        self.completed_receipt: Record | None = None
+        self.app_change_baseline = None
+        self.app_change_input_baseline = None
         self.intent = Sequence(name="IntentPipeline", steps=[parse_write_intent()])
         self.resolution = TargetResolutionPipeline(native)
         self.main = self.build()
@@ -151,7 +156,13 @@ class WritePipeline:
         )
         request = self.intent.run((intent, target, path, query_timeout_ms, forward_current), control)
         try:
-            return await self.main.arun(request, control)
+            result = await self.main.arun(request, control)
+            receipt = {**result, "impact": action_impact(self.state, self.native.policy)}
+            if self.app_change_baseline is not None:
+                receipt["appChangeBaseline"] = self.app_change_baseline
+            if self.app_change_input_baseline is not None:
+                receipt["appChangeInputBaseline"] = self.app_change_input_baseline
+            return receipt
         except BaseException as caught:
             if isinstance(caught, asyncio.CancelledError):
                 error = caught
@@ -162,9 +173,14 @@ class WritePipeline:
                     caught.detail,
                     self.state.dispatched,
                     self.state.preparation,
-                    minimum_effect=caught.effect,
-                    next_step=caught.next,
+                    minimum_effect=(
+                        "possible" if caught.effect == "none" and self.state.native_mutation_possible else caught.effect
+                    ),
+                    # Internal failure metadata requests observation without changing the public error.
+                    # pylint: disable-next=protected-access
+                    observation_reason=caught._observation_reason,
                 )
+                error.scope_cleanup = caught.scope_cleanup
             else:
                 error = failure(
                     "execution_unknown" if self.state.dispatched != Dispatch.NOT_DISPATCHED else "execution_failed",
@@ -172,9 +188,31 @@ class WritePipeline:
                     str(caught),
                     self.state.dispatched,
                     self.state.preparation,
+                    minimum_effect="possible" if self.state.native_mutation_possible else "none",
                 )
+            error.impact = freeze_result(action_impact(self.state, self.native.policy))
+            if isinstance(error, ComputerUseError) and intent.kind == "openMenu":
+                # Internal dispatch evidence preserves the invoked menu target for failure observation.
+                # pylint: disable-next=protected-access
+                error._invoked_menu_target = invoked_ax_menu_target(self.state)
+            if self.app_change_baseline is not None:
+                error.app_change_baseline = self.app_change_baseline
             if error is caught:
                 raise
+            if self.completed_receipt is not None and self.native.calls.retired:
+                # The Gate accepted the original input before finish failed.
+                # Keep resource finalization separate from the input cleanup.
+                result = self.completed_receipt
+                error.action_receipt = FrozenRecord(
+                    {
+                        "status": result["status"],
+                        "target": result["target"],
+                        "detail": result["detail"],
+                        "intent": request.intent.kind,
+                        "impact": error.impact,
+                    }
+                )
+                error.scope_cleanup = "unknown"
             for note in getattr(caught, "__notes__", ()):
                 error.add_note(note)
             raise error from caught
@@ -185,13 +223,25 @@ class WritePipeline:
         async with self.native.calls.operation(
             request.target, cast("Callable[[], int]", control.remaining), intent=request.intent
         ) as lease:
+            self.app_change_baseline = lease.app_change_baseline
             yield OpenedWrite(request, lease)
 
     def consume_decision(
         self, outcome: AttemptOutcome, transition: Continue[BoundWrite] | Done[Record], _: object
     ) -> None:
         """Apply the Gate's transition to this write's shared attempt state."""
+        sampled = outcome.step.app_change_input_baseline if outcome.step is not None else None
+        if sampled is not None and self.app_change_baseline is not None and all(
+            sampled[key] == self.app_change_baseline[key] for key in ("session", "application", "incarnation")
+        ):
+            # Requested input is later than context preparation. Keep its first
+            # native barrier stamp, rather than treating preparation callbacks
+            # as evidence that this input has already been observed.
+            if self.app_change_input_baseline is None:
+                self.app_change_input_baseline = sampled
         self.state.consume(outcome, transition.reason)
+        if isinstance(transition, Done) and self.state.dispatched == Dispatch.DISPATCHED:
+            self.completed_receipt = transition.value
 
 
 if TYPE_CHECKING:

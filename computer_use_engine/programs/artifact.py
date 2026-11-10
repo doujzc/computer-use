@@ -66,7 +66,7 @@ class Artifact:
         manifest_path, entry = root / "manifest.json", root / "program.py"
         if manifest_path.is_symlink() or entry.is_symlink():
             raise ValueError("Artifact files must be regular files inside the selected directory")
-        manifest = json.loads(manifest_path.read_text())
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         required = {"api", "id", "version", "entry", "source_sha256", "parameters", "acceptance", "constraints"}
         if not isinstance(manifest, dict) or set(manifest) != required:
             raise ValueError("Unsupported artifact manifest fields")

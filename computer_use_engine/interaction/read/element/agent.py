@@ -14,6 +14,9 @@ from computer_use.interaction.read.presentation.document import DisplayDocument
 from computer_use.interaction.read.presentation.model import SnapshotRenderRequest
 from computer_use.interaction.read.presentation.pipeline import PrepareSnapshotPipeline
 from computer_use.interaction.read.views.publication import publish, tree_document
+from computer_use.session.events import explicit_observation_completed
+from computer_use.session.interfaces import LookupContext, SurfaceOwner
+from computer_use.session.state import AppState
 
 if TYPE_CHECKING:
     from computer_use.interaction.controller import SessionController
@@ -48,7 +51,7 @@ class AgentElementReadPipeline:
         """Read the element request through the session controller and deliver its observation.
 
         Args:
-            ui: App or Window handle whose instance and observation bounds constrain the
+            ui: App or request scope whose instance and observation bounds constrain the
                 operation.
             snapshot: Facts captured for this observation; display edits do not mutate native
                 evidence.
@@ -61,9 +64,7 @@ class AgentElementReadPipeline:
         target = snapshot["binding"]
         if cursor is not None:
             if not re.fullmatch(r"p[1-9][0-9]*", cursor):
-                raise local_failure(
-                    "this cursor is not a tree continuation", "use the cursor printed by Element.read()"
-                )
+                raise local_failure("this cursor is not a tree continuation")
             page = controller.pages.resolve(cursor, target)
             if "nativeRelationPages" in controller.transport.capabilities:
                 options: Record = dict(relation_page=page)
@@ -71,8 +72,7 @@ class AgentElementReadPipeline:
                 if page["property"] not in ("AXChildren", "Children", "children"):
                     raise local_failure(
                         "this provider cannot page that native relation",
-                        "read its explicit source subtree",
-                        "mode_unsupported",
+                        "unsupported_operation",
                     )
                 options: Record = dict(children_page={key: page[key] for key in ("cursor", "limit")})
         else:
@@ -81,31 +81,62 @@ class AgentElementReadPipeline:
                 if max_nodes > 1 and "nativeNodePages" in controller.transport.capabilities
                 else {}
             )
+        if getattr(ui, "_strict_window", False):
+            options["strict_window"] = True
         tree = await controller.reader.reader.read(
             target, scope_kind=snapshot.get("scope_kind"), max_nodes=max_nodes, **options
         )
         (tree,) = controller.reader.number_snapshots((tree,))
+        selected = next((ref for ref, node in tree.refs.items() if node == target.node), None)
+        if selected is None or target.node in tree.facts["unread"]:
+            raise local_failure("the retained element was unconfirmed in this observation", "observation_incomplete")
         state = controller.state(ui)
         # The pipeline shares retained bindings with their owning service.
         # pylint: disable-next=protected-access
-        controller._remember(state, target, tree)
-        identity = snapshot.get("window_identity")
-        if identity is not None:
-            for ref in tree.refs:
-                state.refs[ref]["window_identity"] = identity
-        ref = next(ref for ref, node in tree.refs.items() if node == target.node)
-        return tree, state.refs[ref]
+        controller.remember_observation(state, target, tree)
+        for field in ("window_identity", "menu_window_identity"):
+            if field in snapshot:
+                for ref in tree.refs:
+                    state.refs[ref][field] = snapshot[field]
+        return tree, state.refs[selected]
 
     async def run(self, ui: UIHandle, snapshot: ElementSnapshot, cursor: str | None) -> Observation:
         tree, fresh = await self.collect(ui, snapshot, cursor)
-        prepared = self.preparation.run(SnapshotRenderRequest(tree, compact=True, public_api=True))
+        prepared = self.preparation.run(
+            SnapshotRenderRequest(tree, compact=True, public_api=True, share_descriptions=False)
+        )
         document = DisplayDocument.join(
             (
                 template("Element {0}:", fresh["source"]["ref"]),
                 "Tree: full",
-                tree_document(self.controller, snapshot["binding"], tree, prepared=prepared, details=True),
+                tree_document(self.controller, snapshot["binding"], tree, prepared=prepared),
             )
         )
+        # An explicit subtree belongs to its snapshot, even when the App
+        # wrapper last staged an unrelated window/menu observation.
+        menus = ()
+        content_owner = None
+        menu_only = fresh.get("scope_kind") == "applicationMenu"
+        identity = fresh.get("menu_window_identity") if menu_only else fresh.get("window_identity")
+        content = fresh.get("scope_kind") == "applicationContent"
+        if menu_only or content:
+            state = self.controller.state(ui)
+            source = AppState(
+                state.selector,
+                running=state.running,
+                # UIHandle exposes the separate instance catalogue to internal pipelines.
+                # pylint: disable-next=protected-access
+                refs=ui._instance.refs,
+                query_target=fresh["binding"],
+                query_scope_kind=fresh["scope_kind"],
+                menu_window_identity=identity,
+            )
+            source_owner = SurfaceOwner(self.controller, source)
+            if menu_only:
+                menus = (source_owner,)
+            else:
+                content_owner = source_owner
+        lookup_context = LookupContext(identity, menu_only, menus, content_owner)
         return publish(
             self.controller,
             ui,
@@ -114,6 +145,8 @@ class AgentElementReadPipeline:
             full=True,
             scope="element:" + repr(snapshot["binding"]),
             view="element",
+            lookup_context=lookup_context,
+            on_observation=explicit_observation_completed if cursor is None else None,
         )
 
 
